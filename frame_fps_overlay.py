@@ -56,6 +56,7 @@ DEFAULTS = {
     "background_alpha": "190",
     # How often the numbers change. The panel itself is redrawn in sync with the display.
     "update_ms": "500",
+    "show_resolution": "0",
 }
 
 FONT_CANDIDATES = [
@@ -106,6 +107,7 @@ class Settings:
         self.background_alpha = max(0, min(255, section.getint("background_alpha")))
         update_ms = section.getint("update_ms")
         self.update_ms = update_ms if update_ms in UPDATE_RATES_MS else int(DEFAULTS["update_ms"])
+        self.show_resolution = section.getboolean("show_resolution")
 
     def save(self):
         cfg = configparser.ConfigParser()
@@ -117,6 +119,7 @@ class Settings:
             "width_m": f"{self.width_m:.2f}",
             "background_alpha": str(self.background_alpha),
             "update_ms": str(self.update_ms),
+            "show_resolution": "1" if self.show_resolution else "0",
         }
         os.makedirs(CONFIG_DIR, exist_ok=True)
         with open(CONFIG_FILE, "w") as f:
@@ -438,8 +441,9 @@ class BatteryStats:
 
 
 class HudRenderer:
-    WIDTH, HEIGHT = 480, 340
+    WIDTH = 480
     LINE = 52
+    PADDING = 14
 
     def __init__(self):
         self.font = load_font(40)
@@ -455,13 +459,7 @@ class HudRenderer:
         points = [(14, 0), (2, 24), (12, 24), (6, 44), (24, 16), (14, 16), (20, 0)]
         draw.polygon([(x + px * s, y + py * s) for px, py in points], fill=GREEN, outline=OUTLINE, width=2)
 
-    def render(self, background_alpha, source, frame, refresh_hz, cpu, gpu, battery, resolution):
-        img = Image.new("RGBA", (self.WIDTH, self.HEIGHT), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(img)
-        draw.rounded_rectangle((0, 0, self.WIDTH - 1, self.HEIGHT - 1), radius=22, fill=(0, 0, 0, background_alpha))
-        if source:
-            draw.text((self.WIDTH - 18, 16), source, font=self.tag_font, fill=GREY, anchor="ra")
-
+    def render(self, background_alpha, source, frame, refresh_hz, cpu, gpu, battery, resolution, show_resolution):
         if frame is None:
             fps_text, fps_color, ft_text = "--", GREY, "--"
         else:
@@ -484,9 +482,18 @@ class HudRenderer:
             ("CPU", "--" if cpu is None else f"{cpu:.0f}%", GREY if cpu is None else self._percent_color(cpu)),
             ("GPU", "--" if gpu is None else f"{gpu:.0f}%", GREY if gpu is None else self._percent_color(gpu)),
             ("BAT", bat_text, bat_color),
-            ("RES", "--" if resolution is None else f"{resolution[0]}x{resolution[1]}", WHITE),
         ]
-        x_label, x_value, y = 24, 124, 14
+        if show_resolution:
+            rows.append(("RES", "--" if resolution is None else f"{resolution[0]}x{resolution[1]}", WHITE))
+
+        height = len(rows) * self.LINE + 2 * self.PADDING
+        img = Image.new("RGBA", (self.WIDTH, height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        draw.rounded_rectangle((0, 0, self.WIDTH - 1, height - 1), radius=22, fill=(0, 0, 0, background_alpha))
+        if source:
+            draw.text((self.WIDTH - 18, 16), source, font=self.tag_font, fill=GREY, anchor="ra")
+
+        x_label, x_value, y = 24, 124, self.PADDING
         for label, value, color in rows:
             # Thin dark stroke keeps the text readable even against bright scenes.
             draw.text((x_label, y), label, font=self.font, fill=GREY, stroke_width=2, stroke_fill=OUTLINE)
@@ -553,7 +560,7 @@ class DoubleBufferedOverlay:
 
 class Menu:
     """The 'FPS Overlay' tab in the SteamVR dashboard: every option for the overlay in one place."""
-    WIDTH, HEIGHT = 800, 750
+    WIDTH, HEIGHT = 800, 840
     BG = (24, 26, 32, 255)
     BUTTON = (58, 62, 74, 255)
     ON = (40, 170, 80, 255)
@@ -595,13 +602,17 @@ class Menu:
         self._row(draw, 410, "Background", f"{round(settings.background_alpha / 255 * 100)}%", "bg-", "bg+")
         self._row(draw, 500, "Update every", f"{settings.update_ms} ms", "rate-", "rate+")
 
-        self._button(draw, (60, 600, 280, 670), "Reset", "reset")
-        self._button(draw, (290, 600, 510, 670), "Update", "update")
-        self._button(draw, (520, 600, 740, 670), "Confirm?" if confirm_uninstall else "Uninstall", "uninstall",
+        draw.text((60, 625), "Resolution", font=self.font, fill=GREY, anchor="lm")
+        self._button(draw, (400, 590, 760, 660), "Shown" if settings.show_resolution else "Hidden", "resolution",
+                     fill=self.ON if settings.show_resolution else self.BUTTON)
+
+        self._button(draw, (60, 690, 280, 760), "Reset", "reset")
+        self._button(draw, (290, 690, 510, 760), "Update", "update")
+        self._button(draw, (520, 690, 740, 760), "Confirm?" if confirm_uninstall else "Uninstall", "uninstall",
                      fill=self.DANGER)
 
         if status:
-            draw.text((self.WIDTH // 2, 710), status, font=self.small_font, fill=YELLOW, anchor="mm")
+            draw.text((self.WIDTH // 2, 800), status, font=self.small_font, fill=YELLOW, anchor="mm")
         return img
 
     def hit(self, x, y):
@@ -700,6 +711,8 @@ def run():
         elif action in ("bg-", "bg+"):
             step = ALPHA_STEP if action == "bg+" else -ALPHA_STEP
             settings.background_alpha = max(0, min(255, settings.background_alpha + step))
+        elif action == "resolution":
+            settings.show_resolution = not settings.show_resolution
         elif action in ("rate-", "rate+"):
             index = UPDATE_RATES_MS.index(settings.update_ms) + (1 if action == "rate+" else -1)
             settings.update_ms = UPDATE_RATES_MS[max(0, min(len(UPDATE_RATES_MS) - 1, index))]
@@ -785,7 +798,7 @@ def run():
                 resolution = (width, height) if width and height else None
             hud.submit(hud_renderer.render(settings.background_alpha, source, frame, refresh_hz,
                                            cpu_stats.percent(), gpu_stats.percent(),
-                                           battery_stats.read(), resolution))
+                                           battery_stats.read(), resolution, settings.show_resolution))
 
         hud.step()
 

@@ -8,7 +8,6 @@ FT   11.2 ms
 CPU  42%
 GPU  77%
 BAT  78% ⚡          (charging)
-RES  2016x2240
 ```
 
 ```
@@ -17,7 +16,7 @@ FT   17.0 ms
 CPU  93%
 GPU  61%
 BAT  24% 1450 mA     (on battery: current draw)
-RES  1920x1080
+RES  1920x1080       (only when Resolution is turned on in the menu)
 ```
 
 - Works for both **VR games** and **flat games** on the virtual screen; the corner tag shows which one is being measured
@@ -52,6 +51,7 @@ Everything else is done in the headset. Open the **SteamVR dashboard** and selec
 | **Size** − / + | Makes the panel smaller or larger |
 | **Background** − / + | Changes how dark the background behind the text is |
 | **Update every** − / + | How often the numbers change: 100, 250, 500 or 1000 ms |
+| **Resolution** | Shows or hides the RES row (hidden by default) |
 | **Reset** | Puts every option back to its default |
 | **Update** | Downloads the latest version and restarts the overlay |
 | **Uninstall** | Removes the overlay and its settings (click twice to confirm) |
@@ -67,7 +67,7 @@ Changes apply straight away and are remembered between sessions.
 | CPU | Overall CPU use from `/proc/stat` |
 | GPU | GPU busy time from the graphics driver's per-process stats (`/proc/*/fdinfo`) |
 | BAT | Headset battery %; while on battery, current draw from `/sys/class/power_supply` |
-| RES | VR: SteamVR's per-eye render size. Flat: the resolution gamescope outputs the game at |
+| RES (optional) | VR: SteamVR's per-eye render size. Flat: the resolution gamescope outputs the game at |
 
 ## Troubleshooting
 
