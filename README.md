@@ -98,7 +98,13 @@ The overlay also has its own guard. If it fails to keep running for a minute twi
 
 ### Flat game stats
 
-If FPS stays at `--` in **Flat game** mode, the log has a line starting `Flat mode: no gamescope frame stats`. It lists what the overlay could find, which shows why the flat-game feed is missing.
+If FPS stays at `--` in **Flat game** mode, start a flat game, set the overlay to **Flat game**, wait about 30 seconds, then run:
+
+```bash
+~/SFrameOverlay/diagnose.sh
+```
+
+It only reads information and changes nothing. The report is printed and saved to `~/frame-overlay-diagnostics.txt`.
 
 ## Limitations
 
