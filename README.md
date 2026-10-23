@@ -60,7 +60,7 @@ Everything else is done in the headset. Open the **SteamVR dashboard** and selec
 | **Update every** − / + | How often the numbers change: 100, 250, 500 or 1000 ms |
 | **Resolution** | Shows or hides the RES row (hidden by default) |
 | **Reset** | Puts every option back to its default |
-| **Update** | Downloads the latest version of the overlay (never your games) and restarts it. If a game is running, it warns you first and you click again to go ahead |
+| **Update** | Downloads the latest version of the overlay (never your games) and restarts it. To avoid problems it won't run while a game is running: exit the game first |
 | **Uninstall** | Removes the overlay and its settings (click twice to confirm) |
 
 Changes apply straight away and are remembered between sessions.

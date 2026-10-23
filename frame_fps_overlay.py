@@ -779,7 +779,7 @@ class Menu:
         self._button(draw, (680, y, 760, y + 70), "+", plus_action)
 
     def render(self, enabled, settings, status, confirming):
-        """`confirming` is the action ("update" or "uninstall") waiting for a second click, or None."""
+        """`confirming` is the action waiting for a second click ("uninstall"), or None."""
         self.buttons = []
         img = Image.new("RGBA", (self.WIDTH, self.HEIGHT), self.BG)
         draw = ImageDraw.Draw(img)
@@ -797,8 +797,7 @@ class Menu:
                      fill=self.ON if settings.show_resolution else None)
 
         self._button(draw, (60, 780, 280, 850), "Reset", "reset")
-        self._button(draw, (290, 780, 510, 850), "Confirm?" if confirming == "update" else "Update", "update",
-                     fill=self.DANGER if confirming == "update" else None)
+        self._button(draw, (290, 780, 510, 850), "Update", "update")
         self._button(draw, (520, 780, 740, 850), "Confirm?" if confirming == "uninstall" else "Uninstall",
                      "uninstall", fill=self.DANGER)
 
@@ -874,7 +873,7 @@ def run():
     state_mtime = None
     next_update = 0.0
     status = ""
-    confirm_action = None  # "update" or "uninstall" while waiting for its second click
+    confirm_action = None  # "uninstall" while waiting for its second click
     confirm_until = 0.0
     refresh_hz = display_refresh_hz(vr_system) or 90.0
     next_refresh_poll = 0.0
@@ -918,9 +917,9 @@ def run():
             source = read_source_dir()
             if not (source and os.path.isdir(os.path.join(source, ".git"))):
                 status = "Update needs the original git checkout"
-            elif not confirmed and game_running():
-                # Updating only touches the overlay, but it restarts mid-game; make that a deliberate choice.
-                ask_to_confirm("update", "Game running! Click again to update overlay")
+            elif game_running():
+                # Updating restarts the overlay and re-runs the installer; never do that mid-game.
+                status = "Exit your game first to update"
             else:
                 status = "Updating the overlay... it will restart"
                 run_detached(f'cd "{source}" && git pull --ff-only && ./install.sh')
