@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Installs Frame FPS Overlay for the current user (no root, no Decky Loader needed).
-# Usage: ./install.sh [--add-steam-shortcut]
+# Installs (or updates) Frame FPS Overlay for the current user. No root, no Decky Loader needed.
+# All options are in the "FPS Overlay" tab of the SteamVR dashboard once installed.
 set -euo pipefail
 
 PYOPENVR_VERSION="2.12.1401"
@@ -21,13 +21,13 @@ esac
 echo "==> Installing to $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$UNIT_DIR"
 install -m 755 "$SRC_DIR/frame_fps_overlay.py" "$INSTALL_DIR/frame_fps_overlay.py"
-install -m 755 "$SRC_DIR/toggle.sh" "$INSTALL_DIR/toggle.sh"
 install -m 755 "$SRC_DIR/uninstall.sh" "$INSTALL_DIR/uninstall.sh"
-[ -f "$CONFIG_DIR/config.ini" ] || install -m 644 "$SRC_DIR/config.ini" "$CONFIG_DIR/config.ini"
 [ -f "$CONFIG_DIR/enabled" ] || echo 1 > "$CONFIG_DIR/enabled"
+# Lets the menu's Update button find this checkout.
+echo "$SRC_DIR" > "$CONFIG_DIR/source_dir"
 
-echo "==> Creating Python environment"
-python3 -m venv "$VENV"
+echo "==> Setting up Python environment"
+[ -x "$VENV/bin/python" ] || python3 -m venv "$VENV"
 "$VENV/bin/pip" install --quiet --upgrade pip
 "$VENV/bin/pip" install --quiet "openvr==$PYOPENVR_VERSION" "pillow>=10.1"
 
@@ -37,7 +37,7 @@ PKG_DIR="$("$VENV/bin/python" -c 'import importlib.util, os; print(os.path.dirna
 curl -fsSL -o "$PKG_DIR/libopenvr_api_64.so" \
     "https://raw.githubusercontent.com/ValveSoftware/openvr/$OPENVR_TAG/bin/$OPENVR_ARCH/libopenvr_api.so"
 
-echo "==> Installing systemd user service"
+echo "==> Installing background service"
 cat > "$UNIT_DIR/frame-fps-overlay.service" <<EOF
 [Unit]
 Description=Frame FPS Overlay (SteamVR performance HUD)
@@ -54,16 +54,6 @@ systemctl --user daemon-reload
 systemctl --user enable frame-fps-overlay.service
 systemctl --user restart frame-fps-overlay.service
 
-if [ "${1:-}" = "--add-steam-shortcut" ]; then
-    if command -v steamos-add-to-steam >/dev/null; then
-        steamos-add-to-steam "$INSTALL_DIR/toggle.sh"
-        echo "==> Added 'toggle.sh' to your Steam library (rename it to 'Toggle FPS Overlay' if you like)"
-    else
-        echo "!! steamos-add-to-steam not found; add $INSTALL_DIR/toggle.sh as a non-Steam game manually" >&2
-    fi
-fi
-
 echo
-echo "Done. The overlay starts automatically whenever SteamVR is running."
-echo "Toggle it from the SteamVR dashboard ('FPS Overlay' tab) or run: $INSTALL_DIR/toggle.sh"
-echo "Adjust position/size/opacity in $CONFIG_DIR/config.ini, then: systemctl --user restart frame-fps-overlay"
+echo "Done. Put on the headset, open the SteamVR dashboard and pick the 'FPS Overlay' tab"
+echo "to turn the overlay on/off, move it, resize it, change the background, update or uninstall."
