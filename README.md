@@ -18,16 +18,31 @@ RES  2016x2240
 
 ## Install (on the headset)
 
-From Desktop Mode (Konsole) on the Frame, or over SSH:
+Open Konsole in Desktop Mode on the Frame (or SSH into it) and paste this one line:
 
 ```bash
-git clone <this repo> ~/FrameFpsOverlay   # or copy the folder over
-cd ~/FrameFpsOverlay
-chmod +x *.sh
-./install.sh
+git clone https://github.com/MWGIH/SFrameOverlay.git ~/SFrameOverlay && cd ~/SFrameOverlay && chmod +x *.sh && ./install.sh
 ```
 
-Pass `--add-steam-shortcut` to also add a "toggle" entry to your Steam library.
+To also add a "toggle" entry to your Steam library, use this instead:
+
+```bash
+git clone https://github.com/MWGIH/SFrameOverlay.git ~/SFrameOverlay && cd ~/SFrameOverlay && chmod +x *.sh && ./install.sh --add-steam-shortcut
+```
+
+If this repo is private, `git clone` will ask you to sign in to GitHub. Use a [personal access token](https://github.com/settings/tokens) as the password.
+
+### Update
+
+```bash
+cd ~/SFrameOverlay && git pull && ./install.sh
+```
+
+### Uninstall
+
+```bash
+~/.local/share/frame-fps-overlay/uninstall.sh
+```
 
 The installer only writes to your home directory. It does not need root and does not touch the read-only SteamOS system files. It:
 
@@ -38,10 +53,39 @@ The installer only writes to your home directory. It does not need root and does
 ## Use
 
 - **Toggle in VR:** open the SteamVR dashboard, select the **FPS Overlay** tab, and click the button
-- **Toggle from a shell:** `~/.local/share/frame-fps-overlay/toggle.sh` (or `toggle.sh on` / `toggle.sh off`)
-- **Move or resize it:** edit `~/.config/frame-fps-overlay/config.ini`, then run `systemctl --user restart frame-fps-overlay`
-- **Logs:** `journalctl --user -u frame-fps-overlay -f`
-- **Uninstall:** `~/.local/share/frame-fps-overlay/uninstall.sh` (add `--purge` to also delete settings)
+- **Toggle from a shell:**
+
+  ```bash
+  ~/.local/share/frame-fps-overlay/toggle.sh
+  ```
+
+  Add `on` or `off` to set it explicitly instead of flipping it.
+
+- **Move or resize it:** edit the config, then restart the service:
+
+  ```bash
+  nano ~/.config/frame-fps-overlay/config.ini
+  ```
+
+  ```bash
+  systemctl --user restart frame-fps-overlay
+  ```
+
+- **Check status / logs:**
+
+  ```bash
+  systemctl --user status frame-fps-overlay
+  ```
+
+  ```bash
+  journalctl --user -u frame-fps-overlay -f
+  ```
+
+- **Uninstall and delete settings too:**
+
+  ```bash
+  ~/.local/share/frame-fps-overlay/uninstall.sh --purge
+  ```
 
 ## What the numbers mean
 
