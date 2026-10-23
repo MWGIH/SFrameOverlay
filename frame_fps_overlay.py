@@ -19,7 +19,6 @@ import configparser
 import ctypes
 import errno
 import glob
-import math
 import os
 import signal
 import struct
@@ -36,6 +35,10 @@ CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("
 STATE_FILE = os.path.join(CONFIG_DIR, "enabled")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.ini")
 SOURCE_DIR_FILE = os.path.join(CONFIG_DIR, "source_dir")
+# Counts starts that ended before running STABLE_SECONDS; see main().
+START_GUARD_FILE = os.path.join(CONFIG_DIR, "failed_starts")
+STABLE_SECONDS = 60.0
+MAX_FAILED_STARTS = 2
 
 TIMING_HISTORY = 256    # frame timings to fetch per refresh (enough for 1 s at 240 Hz)
 CONFIRM_SECONDS = 5.0   # window for the second "Uninstall" click
@@ -541,141 +544,64 @@ BOLT = "bolt"
 SPACE = " "
 
 
-class GlyphAtlas:
-    """
-    Every character the HUD can show, pre-drawn once into one texture.
-
-    Each character slot on the HUD is its own small overlay showing one cell of this
-    texture. Changing a value only changes which cell a slot shows (a texture-bounds
-    update), so after start-up nothing is ever uploaded and the panel can't flicker
-    or make SteamVR hitch while a new texture loads.
-
-    The grid is square so a cell has the same aspect ratio as the whole texture,
-    which keeps the glyphs undistorted however SteamVR sizes a cropped overlay.
-    """
-
-    VALUE_COLORS = [WHITE, GREEN, YELLOW, RED]
-    PAD = 4  # transparent gutter around each glyph so neighbouring cells never bleed in
-
-    def __init__(self, font, advance, line):
-        glyphs = [(SPACE, WHITE), ("-", GREY), (BOLT, GREEN)]
-        glyphs += [(c, color) for c in "0123456789%" for color in self.VALUE_COLORS]
-        glyphs += [(c, WHITE) for c in ".xmAs"]
-        self.cell_w = advance + 2 * self.PAD
-        self.cell_h = line + 2 * self.PAD
-        grid = math.ceil(math.sqrt(len(glyphs)))
-        self.image = Image.new("RGBA", (grid * self.cell_w, grid * self.cell_h), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(self.image)
-        self.bounds = {}
-        for i, (char, color) in enumerate(glyphs):
-            col, row = i % grid, i // grid
-            x0, y0 = col * self.cell_w, row * self.cell_h
-            cx, cy = x0 + self.cell_w / 2, y0 + self.cell_h / 2
-            if char == BOLT:
-                s = line / 52
-                points = [(14, 0), (2, 24), (12, 24), (6, 44), (24, 16), (14, 16), (20, 0)]
-                draw.polygon([(cx + (px - 13) * s, cy + (py - 22) * s) for px, py in points],
-                             fill=GREEN, outline=OUTLINE, width=2)
-            elif char != SPACE:
-                draw.text((cx, cy), char, font=font, fill=color, anchor="mm", stroke_width=2, stroke_fill=OUTLINE)
-            self.bounds[(char, color)] = (x0 / self.image.width, y0 / self.image.height,
-                                          (x0 + self.cell_w) / self.image.width,
-                                          (y0 + self.cell_h) / self.image.height)
-
-    def cell(self, char, color):
-        """Texture bounds for a character, falling back to a near match and finally a blank cell."""
-        if char == "-":
-            color = GREY
-        elif char in ".xmAs":
-            color = WHITE
-        elif char == BOLT:
-            color = GREEN
-        return self.bounds.get((char, color)) or self.bounds.get((char, WHITE)) or self.bounds[(SPACE, WHITE)]
-
-
 class Hud:
-    """The head-locked panel: a static background with labels, plus one overlay per character slot."""
+    """
+    The head-locked panel: a single overlay.
+
+    SteamVR has a small shared limit on overlays (128 for everything on the headset,
+    including gamescope's flat-game windows and the dashboard), so the HUD must only
+    ever use one. The texture is re-sent only when something on it actually changes.
+    """
 
     WIDTH = 480
     LINE = 52
     PADDING = 14
     X_LABEL, X_VALUE = 24, 124
-    # (label, number of character slots), in display order.
-    ROWS = [("FPS", 3), ("FT", 8), ("CPU", 4), ("GPU", 4), ("BAT", 11), ("RES", 9)]
+    ROWS = ["FPS", "FT", "CPU", "GPU", "BAT", "RES"]
 
     def __init__(self, overlay):
         self.overlay = overlay
         self.font = load_font(40)
         self.tag_font = load_font(22)
-        self.advance = math.ceil(self.font.getlength("0"))
-        self.atlas = GlyphAtlas(self.font, self.advance, self.LINE)
-        self.background_key = None
-        self.rows = []
-        self.visible = False
-
-        self.background = overlay.createOverlay(APP_KEY + ".hud", "FPS Overlay HUD")
-        overlay.setOverlaySortOrder(self.background, 100)
-        atlas_texture = to_texture(self.atlas.image)
-        blank = self.atlas.cell(SPACE, WHITE)
-        self.slots = {}   # label -> [overlay handle per character]
-        self.shown = {}   # overlay handle -> texture bounds currently shown
-        for label, count in self.ROWS:
-            handles = []
-            for i in range(count):
-                handle = overlay.createOverlay(f"{APP_KEY}.hud.{label.lower()}.{i}", f"FPS Overlay {label} {i}")
-                overlay.setOverlaySortOrder(handle, 101)
-                overlay.setOverlayRaw(handle, atlas_texture, self.atlas.image.width, self.atlas.image.height, 4)
-                self._set_bounds(handle, blank)
-                # Child overlays follow the background's visibility, so they can stay "shown".
-                overlay.showOverlay(handle)
-                handles.append(handle)
-            self.slots[label] = handles
-
-    def _rows(self, show_resolution):
-        return [label for label, _ in self.ROWS if show_resolution or label != "RES"]
-
-    def _set_bounds(self, handle, bounds):
-        if self.shown.get(handle) == bounds:
-            return
-        tb = openvr.VRTextureBounds_t()
-        tb.uMin, tb.vMin, tb.uMax, tb.vMax = bounds
-        self.overlay.setOverlayTextureBounds(handle, tb)
-        self.shown[handle] = bounds
+        self.advance = self.font.getlength("0")
+        self.handle = overlay.createOverlay(APP_KEY + ".hud", "FPS Overlay HUD")
+        overlay.setOverlaySortOrder(self.handle, 100)
+        self.settings_key = None
+        self.values = None
+        self.shown_key = None
 
     def configure(self, settings):
-        """Applies placement, size, background and row layout. Only re-uploads the background if it changed."""
-        rows = self._rows(settings.show_resolution)
-        height = len(rows) * self.LINE + 2 * self.PADDING
-        key = (settings.background_alpha, settings.mode, tuple(rows))
-        if key != self.background_key:
-            self.background_key = key
-            img = self._render_background(settings.background_alpha, settings.mode, rows, height)
-            self.overlay.setOverlayRaw(self.background, to_texture(img), img.width, img.height, 4)
-
-        self.overlay.setOverlayWidthInMeters(self.background, settings.width_m)
+        """Applies placement, size, background and row layout."""
+        self.settings_key = (settings.background_alpha, settings.mode, settings.show_resolution)
+        self.overlay.setOverlayWidthInMeters(self.handle, settings.width_m)
         self.overlay.setOverlayTransformTrackedDeviceRelative(
-            self.background, openvr.k_unTrackedDeviceIndex_Hmd, settings.head_transform())
+            self.handle, openvr.k_unTrackedDeviceIndex_Hmd, settings.head_transform())
+        self._redraw()
 
-        self.rows = rows
-        metres_per_px = settings.width_m / self.WIDTH
-        blank = self.atlas.cell(SPACE, WHITE)
-        for label, handles in self.slots.items():
-            # Slots of a hidden row stay attached to the panel (so they hide with it) but show nothing.
-            row = rows.index(label) if label in rows else 0
-            for i, handle in enumerate(handles):
-                self.overlay.setOverlayWidthInMeters(handle, self.atlas.cell_w * metres_per_px)
-                if label not in rows:
-                    self._set_bounds(handle, blank)
-                cx = self.X_VALUE + self.advance * i + self.advance / 2
-                cy = self.PADDING + self.LINE * row + self.LINE / 2
-                m = openvr.HmdMatrix34_t()
-                m[0][0] = m[1][1] = m[2][2] = 1.0
-                m[0][3] = (cx - self.WIDTH / 2) * metres_per_px
-                m[1][3] = (height / 2 - cy) * metres_per_px
-                m[2][3] = 0.001  # just in front of the background
-                self.overlay.setOverlayTransformOverlayRelative(handle, self.background, m)
+    def set_visible(self, visible):
+        if visible:
+            self.overlay.showOverlay(self.handle)
+        else:
+            self.overlay.hideOverlay(self.handle)
 
-    def _render_background(self, alpha, mode, rows, height):
+    def show_values(self, values):
+        """values: label -> list of (char, color)."""
+        self.values = values
+        self._redraw()
+
+    def _redraw(self):
+        if self.settings_key is None or self.values is None:
+            return
+        key = (self.settings_key, repr(self.values))
+        if key == self.shown_key:
+            return
+        self.shown_key = key
+        img = self.render(*self.settings_key, self.values)
+        self.overlay.setOverlayRaw(self.handle, to_texture(img), img.width, img.height, 4)
+
+    def render(self, alpha, mode, show_resolution, values):
+        rows = [label for label in self.ROWS if show_resolution or label != "RES"]
+        height = len(rows) * self.LINE + 2 * self.PADDING
         img = Image.new("RGBA", (self.WIDTH, height), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
         draw.rounded_rectangle((0, 0, self.WIDTH - 1, height - 1), radius=22, fill=(0, 0, 0, alpha))
@@ -685,24 +611,21 @@ class Hud:
             # Thin dark stroke keeps the text readable even against bright scenes.
             draw.text((self.X_LABEL, cy), label, font=self.font, fill=GREY, anchor="lm",
                       stroke_width=2, stroke_fill=OUTLINE)
+            for i, (char, color) in enumerate(values.get(label, [])):
+                cx = self.X_VALUE + self.advance * i + self.advance / 2
+                if char == BOLT:
+                    self._bolt(draw, cx, cy)
+                elif char != SPACE:
+                    draw.text((cx, cy), char, font=self.font, fill=color, anchor="mm",
+                              stroke_width=2, stroke_fill=OUTLINE)
         return img
 
-    def set_visible(self, visible):
-        self.visible = visible
-        if visible:
-            self.overlay.showOverlay(self.background)
-        else:
-            self.overlay.hideOverlay(self.background)
-
-    def show_values(self, values):
-        """values: label -> list of (char, color). Only slots whose character changed are touched."""
-        for label, cells in values.items():
-            handles = self.slots[label]
-            if label not in self.rows:
-                cells = []
-            cells = (cells + [(SPACE, WHITE)] * len(handles))[:len(handles)]
-            for handle, (char, color) in zip(handles, cells):
-                self._set_bounds(handle, self.atlas.cell(char, color))
+    def _bolt(self, draw, cx, cy):
+        """Charging icon: a lightning bolt roughly one text line tall."""
+        s = self.LINE / 52
+        points = [(14, 0), (2, 24), (12, 24), (6, 44), (24, 16), (14, 16), (20, 0)]
+        draw.polygon([(cx + (px - 13) * s, cy + (py - 22) * s) for px, py in points],
+                     fill=GREEN, outline=OUTLINE, width=2)
 
 
 def colored(text, color):
@@ -847,7 +770,16 @@ def display_refresh_hz(vr_system):
         return None
 
 
-def run():
+def write_failed_starts(count):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(START_GUARD_FILE, "w") as f:
+        f.write(f"{count}\n")
+
+
+def run(on_stable):
+    """Runs the overlay until SteamVR quits. Calls on_stable() once it has run for STABLE_SECONDS."""
+    started = time.monotonic()
+    stable_reported = False
     settings = Settings()
     if not os.path.exists(STATE_FILE):
         write_enabled(True)
@@ -939,6 +871,10 @@ def run():
     while True:
         frame_start = time.monotonic()
 
+        if not stable_reported and frame_start - started >= STABLE_SECONDS:
+            stable_reported = True
+            on_stable()
+
         while vr_system.pollNextEvent(event):
             if event.eventType == openvr.VREvent_Quit:
                 vr_system.acknowledgeQuit_Exiting()
@@ -1000,8 +936,25 @@ def main():
     # Wait for SteamVR rather than launching it; systemd restarts us after SteamVR quits.
     while not steamvr_running():
         time.sleep(5)
+
+    # Boot-loop guard: if the overlay ever takes the headset session down with it, the
+    # next start would do the same. Every start that doesn't survive STABLE_SECONDS (or
+    # end with a normal SteamVR quit) is counted; after MAX_FAILED_STARTS the overlay
+    # stays off until it is reinstalled, which clears the count.
     try:
-        run()
+        failed_starts = int(read_text(START_GUARD_FILE) or 0)
+    except ValueError:
+        failed_starts = 0
+    if failed_starts >= MAX_FAILED_STARTS:
+        log(f"Not starting: the last {failed_starts} starts ended within {STABLE_SECONDS:.0f} s. "
+            "Re-run the install line to clear this and try again.")
+        while True:
+            time.sleep(3600)  # stay idle so systemd doesn't keep restarting us
+    write_failed_starts(failed_starts + 1)
+
+    try:
+        run(on_stable=lambda: write_failed_starts(0))
+        write_failed_starts(0)  # SteamVR quit normally
     finally:
         openvr.shutdown()
 

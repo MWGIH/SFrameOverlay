@@ -25,6 +25,8 @@ install -m 755 "$SRC_DIR/uninstall.sh" "$INSTALL_DIR/uninstall.sh"
 [ -f "$CONFIG_DIR/enabled" ] || echo 1 > "$CONFIG_DIR/enabled"
 # Lets the menu's Update button find this checkout.
 echo "$SRC_DIR" > "$CONFIG_DIR/source_dir"
+# Clears the boot-loop guard so a fresh install always gets to start.
+rm -f "$CONFIG_DIR/failed_starts"
 
 echo "==> Setting up Python environment"
 [ -x "$VENV/bin/python" ] || python3 -m venv "$VENV"

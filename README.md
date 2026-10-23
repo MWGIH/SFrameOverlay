@@ -21,7 +21,8 @@ RES  1920x1080       (only when Resolution is turned on in the menu)
 
 - Measures **VR games** or **flat games** on the virtual screen; pick which in the menu, and the corner tag shows the current choice
 - Semi-opaque black rounded background with outlined text, readable on bright scenes
-- No flicker or stutter on updates: every character is drawn once at start-up, and updating a number only switches which pre-drawn character is shown, so nothing new is ever sent to SteamVR
+- Uses a single SteamVR overlay for the panel, and only sends a new image when a value actually changes
+- Boot-loop guard: if the overlay fails to keep running twice in a row, it stays off until you reinstall it
 - Numbers update every 500 ms by default (adjustable in the menu)
 - FPS is green at or above 95% of the headset refresh rate, yellow at or above 75%, red below that
 - CPU / GPU are green below 70%, yellow below 90%, red above
@@ -83,6 +84,18 @@ If the overlay or its tab doesn't show up, or a value stays at `--`, this prints
 ```bash
 journalctl --user -u frame-fps-overlay -n 50
 ```
+
+### If the headset keeps crashing or restarting
+
+Stop the overlay and keep it from starting on boot. Run this over SSH, or in Konsole as soon as you can open it:
+
+```bash
+systemctl --user disable --now frame-fps-overlay.service
+```
+
+The overlay also has its own guard. If it fails to keep running for a minute twice in a row, it stays off, and the log says `Not starting`. Running the install line again clears this and turns it back on.
+
+### Flat game stats
 
 If FPS stays at `--` in **Flat game** mode, the log has a line starting `Flat mode: no gamescope frame stats`. It lists what the overlay could find, which shows why the flat-game feed is missing.
 
