@@ -778,7 +778,8 @@ class Menu:
         draw.text((580, y + 35), value, font=self.font, fill=WHITE, anchor="mm")
         self._button(draw, (680, y, 760, y + 70), "+", plus_action)
 
-    def render(self, enabled, settings, status, confirm_uninstall):
+    def render(self, enabled, settings, status, confirming):
+        """`confirming` is the action ("update" or "uninstall") waiting for a second click, or None."""
         self.buttons = []
         img = Image.new("RGBA", (self.WIDTH, self.HEIGHT), self.BG)
         draw = ImageDraw.Draw(img)
@@ -796,9 +797,10 @@ class Menu:
                      fill=self.ON if settings.show_resolution else None)
 
         self._button(draw, (60, 780, 280, 850), "Reset", "reset")
-        self._button(draw, (290, 780, 510, 850), "Update", "update")
-        self._button(draw, (520, 780, 740, 850), "Confirm?" if confirm_uninstall else "Uninstall", "uninstall",
-                     fill=self.DANGER)
+        self._button(draw, (290, 780, 510, 850), "Confirm?" if confirming == "update" else "Update", "update",
+                     fill=self.DANGER if confirming == "update" else None)
+        self._button(draw, (520, 780, 740, 850), "Confirm?" if confirming == "uninstall" else "Uninstall",
+                     "uninstall", fill=self.DANGER)
 
         if status:
             draw.text((self.WIDTH // 2, 890), status, font=self.small_font, fill=YELLOW, anchor="mm")
@@ -826,6 +828,15 @@ def steamvr_running():
         return False
     openvr.shutdown()
     return True
+
+
+def game_running():
+    """True while Steam has a game running. Steam starts every game under `reaper SteamLaunch AppId=<id>`."""
+    for path in glob.glob("/proc/[0-9]*/cmdline"):
+        args = (read_text(path) or "").split("\0")
+        if "SteamLaunch" in args and any(a.startswith("AppId=") and a != "AppId=0" for a in args):
+            return True
+    return False
 
 
 def display_refresh_hz(vr_system):
@@ -863,18 +874,25 @@ def run():
     state_mtime = None
     next_update = 0.0
     status = ""
+    confirm_action = None  # "update" or "uninstall" while waiting for its second click
     confirm_until = 0.0
-    shown_confirm = False
     refresh_hz = display_refresh_hz(vr_system) or 90.0
     next_refresh_poll = 0.0
     event = openvr.VREvent_t()
 
     def redraw_menu():
-        img = menu.render(enabled, settings, status, time.monotonic() < confirm_until)
+        img = menu.render(enabled, settings, status, confirm_action)
         overlay.setOverlayRaw(menu_handle, to_texture(img), img.width, img.height, 4)
 
+    def ask_to_confirm(action, message):
+        nonlocal status, confirm_action, confirm_until
+        confirm_action, confirm_until = action, time.monotonic() + CONFIRM_SECONDS
+        status = message
+
     def handle(action):
-        nonlocal status, confirm_until
+        nonlocal status, confirm_action
+        confirmed = action == confirm_action and time.monotonic() < confirm_until
+        confirm_action = None
         status = ""
         if action == "toggle":
             write_enabled(not enabled)
@@ -898,18 +916,20 @@ def run():
             status = "Settings reset to defaults"
         elif action == "update":
             source = read_source_dir()
-            if source and os.path.isdir(os.path.join(source, ".git")):
-                status = "Updating... the overlay will restart"
-                run_detached(f'cd "{source}" && git pull --ff-only && ./install.sh')
-            else:
+            if not (source and os.path.isdir(os.path.join(source, ".git"))):
                 status = "Update needs the original git checkout"
+            elif not confirmed and game_running():
+                # Updating only touches the overlay, but it restarts mid-game; make that a deliberate choice.
+                ask_to_confirm("update", "Game running! Click again to update overlay")
+            else:
+                status = "Updating the overlay... it will restart"
+                run_detached(f'cd "{source}" && git pull --ff-only && ./install.sh')
         elif action == "uninstall":
-            if time.monotonic() < confirm_until:
+            if confirmed:
                 status = "Uninstalling..."
                 run_detached(f'"{INSTALL_DIR}/uninstall.sh"')
             else:
-                confirm_until = time.monotonic() + CONFIRM_SECONDS
-                status = "Click again to uninstall"
+                ask_to_confirm("uninstall", "Click again to uninstall")
         if action not in ("toggle", "update", "uninstall"):
             settings.save()
             hud.configure(settings)
@@ -947,12 +967,11 @@ def run():
                 redraw_menu()
                 next_update = 0.0
 
-        # Let the uninstall confirmation lapse on its own.
-        confirming = time.monotonic() < confirm_until
-        if shown_confirm and not confirming:
+        # Let an unanswered confirmation lapse on its own.
+        if confirm_action and time.monotonic() >= confirm_until:
+            confirm_action = None
             status = ""
             redraw_menu()
-        shown_confirm = confirming
 
         if frame_start >= next_refresh_poll:
             next_refresh_poll = frame_start + REFRESH_POLL_SECONDS
