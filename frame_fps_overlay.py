@@ -546,11 +546,19 @@ SPACE = " "
 
 class Hud:
     """
-    The head-locked panel: a single overlay.
+    The head-locked panel, made of three overlays at the same spot:
+
+    * a background layer (panel and labels), only redrawn when a menu setting changes;
+    * two text layers that take turns showing the values.
+
+    Replacing an overlay's texture in place can leave it blank for a frame while the
+    new texture loads, which shows up as a flicker. So new values are drawn onto the
+    hidden text layer, given LOAD_FRAMES display frames to load, and then swapped in at
+    the start of a frame. The background never changes during play, so it can't flicker.
 
     SteamVR has a small shared limit on overlays (128 for everything on the headset,
-    including gamescope's flat-game windows and the dashboard), so the HUD must only
-    ever use one. The texture is re-sent only when something on it actually changes.
+    including gamescope's flat-game windows and the dashboard), so the HUD deliberately
+    stays at three.
     """
 
     WIDTH = 480
@@ -558,59 +566,103 @@ class Hud:
     PADDING = 14
     X_LABEL, X_VALUE = 24, 124
     ROWS = ["FPS", "FT", "CPU", "GPU", "BAT", "RES"]
+    LOAD_FRAMES = 2
 
     def __init__(self, overlay):
         self.overlay = overlay
         self.font = load_font(40)
         self.tag_font = load_font(22)
         self.advance = self.font.getlength("0")
-        self.handle = overlay.createOverlay(APP_KEY + ".hud", "FPS Overlay HUD")
-        overlay.setOverlaySortOrder(self.handle, 100)
-        self.settings_key = None
+        self.background = overlay.createOverlay(APP_KEY + ".hud", "FPS Overlay HUD")
+        overlay.setOverlaySortOrder(self.background, 100)
+        self.text = [overlay.createOverlay(f"{APP_KEY}.hud.text{i}", f"FPS Overlay HUD text {i}") for i in range(2)]
+        for handle in self.text:
+            overlay.setOverlaySortOrder(handle, 101)
+        self.front = 0              # index of the text layer currently shown
+        self.front_loaded = False
+        self.loading_since = None   # frame counter when the back layer's texture was sent
+        self.visible = False
+        self.layout_key = None      # (alpha, mode, rows) the background was drawn for
+        self.rows = []
         self.values = None
-        self.shown_key = None
+        self.text_key = None        # (rows, values) last sent to a text layer
+        self.pending = None         # text image waiting to go to the back layer
 
     def configure(self, settings):
-        """Applies placement, size, background and row layout."""
-        self.settings_key = (settings.background_alpha, settings.mode, settings.show_resolution)
-        self.overlay.setOverlayWidthInMeters(self.handle, settings.width_m)
-        self.overlay.setOverlayTransformTrackedDeviceRelative(
-            self.handle, openvr.k_unTrackedDeviceIndex_Hmd, settings.head_transform())
-        self._redraw()
+        """Applies placement, size and background. The background is only redrawn if its look changed."""
+        self.rows = [label for label in self.ROWS if settings.show_resolution or label != "RES"]
+        layout_key = (settings.background_alpha, settings.mode, tuple(self.rows))
+        if layout_key != self.layout_key:
+            self.layout_key = layout_key
+            img = self._render_background(settings.background_alpha, settings.mode)
+            self.overlay.setOverlayRaw(self.background, to_texture(img), img.width, img.height, 4)
+        for handle in [self.background, *self.text]:
+            self.overlay.setOverlayWidthInMeters(handle, settings.width_m)
+            self.overlay.setOverlayTransformTrackedDeviceRelative(
+                handle, openvr.k_unTrackedDeviceIndex_Hmd, settings.head_transform())
+        self._queue_text()
 
     def set_visible(self, visible):
+        self.visible = visible
         if visible:
-            self.overlay.showOverlay(self.handle)
+            self.overlay.showOverlay(self.background)
+            if self.front_loaded:
+                self.overlay.showOverlay(self.text[self.front])
         else:
-            self.overlay.hideOverlay(self.handle)
+            for handle in [self.background, *self.text]:
+                self.overlay.hideOverlay(handle)
 
     def show_values(self, values):
         """values: label -> list of (char, color)."""
         self.values = values
-        self._redraw()
+        self._queue_text()
 
-    def _redraw(self):
-        if self.settings_key is None or self.values is None:
+    def _queue_text(self):
+        if self.values is None:
             return
-        key = (self.settings_key, repr(self.values))
-        if key == self.shown_key:
-            return
-        self.shown_key = key
-        img = self.render(*self.settings_key, self.values)
-        self.overlay.setOverlayRaw(self.handle, to_texture(img), img.width, img.height, 4)
+        key = (tuple(self.rows), repr(self.values))
+        if key != self.text_key:
+            self.text_key = key
+            self.pending = self._render_text(self.values)
 
-    def render(self, alpha, mode, show_resolution, values):
-        rows = [label for label in self.ROWS if show_resolution or label != "RES"]
-        height = len(rows) * self.LINE + 2 * self.PADDING
-        img = Image.new("RGBA", (self.WIDTH, height), (0, 0, 0, 0))
+    def step(self, frame_counter):
+        """Call once per display frame, just after vsync."""
+        back = 1 - self.front
+        if self.loading_since is not None:
+            if frame_counter - self.loading_since >= self.LOAD_FRAMES:
+                # Show the new layer before hiding the old one so there is never a frame with neither.
+                if self.visible:
+                    self.overlay.showOverlay(self.text[back])
+                self.overlay.hideOverlay(self.text[self.front])
+                self.front, self.front_loaded, self.loading_since = back, True, None
+        elif self.pending is not None:
+            img, self.pending = self.pending, None
+            self.overlay.setOverlayRaw(self.text[back], to_texture(img), img.width, img.height, 4)
+            self.loading_since = frame_counter
+
+    def _height(self):
+        return len(self.rows) * self.LINE + 2 * self.PADDING
+
+    def _row_centre(self, row):
+        return self.PADDING + self.LINE * row + self.LINE / 2
+
+    def _render_background(self, alpha, mode):
+        img = Image.new("RGBA", (self.WIDTH, self._height()), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
-        draw.rounded_rectangle((0, 0, self.WIDTH - 1, height - 1), radius=22, fill=(0, 0, 0, alpha))
+        draw.rounded_rectangle((0, 0, self.WIDTH - 1, img.height - 1), radius=22, fill=(0, 0, 0, alpha))
         draw.text((self.WIDTH - 18, 16), mode.upper(), font=self.tag_font, fill=GREY, anchor="ra")
-        for row, label in enumerate(rows):
-            cy = self.PADDING + self.LINE * row + self.LINE / 2
+        for row, label in enumerate(self.rows):
             # Thin dark stroke keeps the text readable even against bright scenes.
-            draw.text((self.X_LABEL, cy), label, font=self.font, fill=GREY, anchor="lm",
+            draw.text((self.X_LABEL, self._row_centre(row)), label, font=self.font, fill=GREY, anchor="lm",
                       stroke_width=2, stroke_fill=OUTLINE)
+        return img
+
+    def _render_text(self, values):
+        """The values on a transparent canvas the same size as the background, so the layers line up."""
+        img = Image.new("RGBA", (self.WIDTH, self._height()), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        for row, label in enumerate(self.rows):
+            cy = self._row_centre(row)
             for i, (char, color) in enumerate(values.get(label, [])):
                 cx = self.X_VALUE + self.advance * i + self.advance / 2
                 if char == BOLT:
@@ -618,6 +670,12 @@ class Hud:
                 elif char != SPACE:
                     draw.text((cx, cy), char, font=self.font, fill=color, anchor="mm",
                               stroke_width=2, stroke_fill=OUTLINE)
+        return img
+
+    def render(self, alpha, mode, values):
+        """The full panel as one image (background + text), for previews and tests."""
+        img = self._render_background(alpha, mode)
+        img.alpha_composite(self._render_text(values))
         return img
 
     def _bolt(self, draw, cx, cy):
@@ -770,6 +828,18 @@ def display_refresh_hz(vr_system):
         return None
 
 
+VSYNC_MARGIN = 0.001  # wake this long after vsync, so the frame counter has moved on
+
+
+def seconds_until_next_frame(vr_system, refresh_hz, frame_start):
+    """Sleep time that wakes the loop just after the display's next vsync."""
+    period = 1.0 / refresh_hz
+    has_vsync, since_vsync, _ = vr_system.getTimeSinceLastVsync()
+    if not has_vsync:
+        return max(0.0, period - (time.monotonic() - frame_start))
+    return (period - since_vsync % period) + VSYNC_MARGIN
+
+
 def write_failed_starts(count):
     os.makedirs(CONFIG_DIR, exist_ok=True)
     with open(START_GUARD_FILE, "w") as f:
@@ -867,9 +937,15 @@ def run(on_stable):
         redraw_menu()
 
     hud.configure(settings)
+    ticks = 0
 
     while True:
         frame_start = time.monotonic()
+        ticks += 1
+
+        # Swap HUD layers first thing after vsync, so the change lands at the start of a frame.
+        has_vsync, _, frame_counter = vr_system.getTimeSinceLastVsync()
+        hud.step(frame_counter if has_vsync else ticks)
 
         if not stable_reported and frame_start - started >= STABLE_SECONDS:
             stable_reported = True
@@ -927,8 +1003,7 @@ def run(on_stable):
             hud.show_values(format_values(frame, refresh_hz, cpu_stats.percent(), gpu_stats.percent(),
                                           battery_stats.read(), resolution))
 
-        # Pace the loop to the display refresh rate.
-        time.sleep(max(0.0, 1.0 / refresh_hz - (time.monotonic() - frame_start)))
+        time.sleep(seconds_until_next_frame(vr_system, refresh_hz, frame_start))
 
 
 def main():

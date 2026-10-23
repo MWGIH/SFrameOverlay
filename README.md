@@ -21,7 +21,8 @@ RES  1920x1080       (only when Resolution is turned on in the menu)
 
 - Measures **VR games** or **flat games** on the virtual screen; pick which in the menu, and the corner tag shows the current choice
 - Semi-opaque black rounded background with outlined text, readable on bright scenes
-- Uses a single SteamVR overlay for the panel, and only sends a new image when a value actually changes
+- Flicker-free updates, synced to the display's refresh rate: the background never changes during play, and new numbers are drawn on a hidden layer, given 2 frames to load, then swapped in right after a vsync
+- Uses just 3 SteamVR overlays for the panel, staying well within SteamVR's shared overlay limit
 - Boot-loop guard: if the overlay fails to keep running twice in a row, it stays off until you reinstall it
 - Numbers update every 500 ms by default (adjustable in the menu)
 - FPS is green at or above 95% of the headset refresh rate, yellow at or above 75%, red below that
