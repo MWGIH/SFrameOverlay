@@ -30,13 +30,19 @@ RES  1920x1080       (only when Resolution is turned on in the menu)
 
 ## Install
 
-Open Konsole in Desktop Mode on the Frame (or SSH into it), paste this line and press Enter:
+You can install it straight from the headset. You don't need Desktop Mode.
+
+1. **Turn on Developer Mode:** on the Frame, open **Settings → General** and turn on **Developer Mode**. This lets you open the web browser and Konsole (the terminal) directly.
+2. **Open this page in the browser** so you can copy the install line below.
+3. **Open Konsole,** paste the line and press Enter:
 
 ```bash
 cd ~ && (git clone https://github.com/MWGIH/SFrameOverlay.git || git -C SFrameOverlay pull) && SFrameOverlay/install.sh
 ```
 
 That's it. The overlay starts automatically whenever SteamVR is running. Running the same line again later updates it.
+
+You can also run the install line from Konsole in Desktop Mode, or over SSH.
 
 If this repo is private, `git clone` will ask you to sign in to GitHub. Use a [personal access token](https://github.com/settings/tokens) as the password.
 
