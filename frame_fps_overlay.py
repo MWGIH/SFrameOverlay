@@ -16,6 +16,7 @@ dashboard.
 import configparser
 import ctypes
 import glob
+import json
 import os
 import signal
 import subprocess
@@ -34,6 +35,11 @@ SOURCE_DIR_FILE = os.path.join(CONFIG_DIR, "source_dir")
 # Counts starts that ended before running STABLE_SECONDS; see main().
 START_GUARD_FILE = os.path.join(CONFIG_DIR, "failed_starts")
 STABLE_SECONDS = 60.0
+# Written by SFRecorder while it records: the recorded view and whether the HUD should be in it.
+RECORDER_VIEW_FILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "sfrecorder", "view.json")
+RECORDER_POLL_SECONDS = 0.5
+# Fraction of the recorded view the HUD may use, so it never touches the video's edge.
+RECORDER_VIEW_MARGIN = 0.92
 MAX_FAILED_STARTS = 2
 
 TIMING_HISTORY = 256    # frame timings to fetch per refresh (enough for 1 s at 240 Hz)
@@ -58,6 +64,8 @@ DEFAULTS = {
     # How often the numbers change.
     "update_ms": "500",
     "show_resolution": "0",
+    # Pull the HUD in so it stays inside SFRecorder's recording.
+    "keep_in_recording": "1",
 }
 
 FONT_CANDIDATES = [
@@ -113,6 +121,7 @@ class Settings:
         update_ms = section.getint("update_ms")
         self.update_ms = update_ms if update_ms in UPDATE_RATES_MS else int(DEFAULTS["update_ms"])
         self.show_resolution = section.getboolean("show_resolution")
+        self.keep_in_recording = section.getboolean("keep_in_recording")
 
     def save(self):
         cfg = configparser.ConfigParser()
@@ -125,6 +134,7 @@ class Settings:
             "background_alpha": str(self.background_alpha),
             "update_ms": str(self.update_ms),
             "show_resolution": "1" if self.show_resolution else "0",
+            "keep_in_recording": "1" if self.keep_in_recording else "0",
         }
         os.makedirs(CONFIG_DIR, exist_ok=True)
         with open(CONFIG_FILE, "w") as f:
@@ -137,13 +147,43 @@ class Settings:
             pass
         self.load()
 
-    def head_transform(self):
+    def head_transform(self, height_m, view=None):
+        """Placement in front of the head. With a recorder `view`, the panel is pulled in to fit inside it."""
+        margin_x, margin_y = self.margin_x, self.margin_y
+        if view and self.keep_in_recording:
+            margin_x, margin_y = fit_in_view(self, height_m, view)
         m = openvr.HmdMatrix34_t()
         m[0][0] = m[1][1] = m[2][2] = 1.0
-        m[0][3] = -self.margin_x if "left" in self.corner else self.margin_x
-        m[1][3] = self.margin_y if "top" in self.corner else -self.margin_y
+        m[0][3] = -margin_x if "left" in self.corner else margin_x
+        m[1][3] = margin_y if "top" in self.corner else -margin_y
         m[2][3] = -self.distance
         return m
+
+
+def fit_in_view(settings, height_m, view):
+    """Margins that keep the whole panel inside the recorded view (tangents left/right/up/down).
+
+    Margins only ever shrink: a HUD that already fits stays where the user put it.
+    """
+    half_w, half_h = settings.width_m / 2, height_m / 2
+    side = view["left"] if "left" in settings.corner else view["right"]
+    vertical = view["up"] if "top" in settings.corner else view["down"]
+    max_x = side * settings.distance * RECORDER_VIEW_MARGIN - half_w
+    max_y = vertical * settings.distance * RECORDER_VIEW_MARGIN - half_h
+    return max(0.0, min(settings.margin_x, max_x)), max(0.0, min(settings.margin_y, max_y))
+
+
+def read_recorder_view():
+    """SFRecorder's view while it is recording, or None. A file left behind by a recorder that died is ignored."""
+    try:
+        with open(RECORDER_VIEW_FILE) as f:
+            view = json.load(f)
+        os.kill(int(view["pid"]), 0)
+        for key in ("left", "right", "up", "down"):
+            view[key] = float(view[key])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return view
 
 
 def read_enabled():
@@ -393,18 +433,22 @@ class Hud:
         self.text_key = None        # (rows, values) last sent to a text layer
         self.pending = None         # text image waiting to go to the back layer
 
-    def configure(self, settings):
-        """Applies placement, size and background. The background is only redrawn if its look changed."""
+    def configure(self, settings, view=None):
+        """Applies placement, size and background. The background is only redrawn if its look changed.
+
+        `view` is SFRecorder's recorded view while it records (see read_recorder_view).
+        """
         self.rows = [label for label in self.ROWS if settings.show_resolution or label != "RES"]
         layout_key = (settings.background_alpha, tuple(self.rows))
         if layout_key != self.layout_key:
             self.layout_key = layout_key
             img = self._render_background(settings.background_alpha)
             self.overlay.setOverlayRaw(self.background, to_texture(img), img.width, img.height, 4)
+        height_m = settings.width_m * self._height() / self.WIDTH
         for handle in [self.background, *self.text]:
             self.overlay.setOverlayWidthInMeters(handle, settings.width_m)
             self.overlay.setOverlayTransformTrackedDeviceRelative(
-                handle, openvr.k_unTrackedDeviceIndex_Hmd, settings.head_transform())
+                handle, openvr.k_unTrackedDeviceIndex_Hmd, settings.head_transform(height_m, view))
         self._queue_text()
 
     def set_visible(self, visible):
@@ -533,7 +577,7 @@ def format_values(frame, refresh_hz, cpu, gpu, battery, resolution):
 
 class Menu:
     """The 'FPS Overlay' tab in the SteamVR dashboard: every option for the overlay in one place."""
-    WIDTH, HEIGHT = 800, 840
+    WIDTH, HEIGHT = 800, 930
     BG = (24, 26, 32, 255)
     BUTTON = (58, 62, 74, 255)
     ON = (40, 170, 80, 255)
@@ -579,14 +623,16 @@ class Menu:
         self._row(draw, 500, "Update every", f"{settings.update_ms} ms", "rate-", "rate+")
         self._choice(draw, 590, "Resolution", "Shown" if settings.show_resolution else "Hidden", "resolution",
                      fill=self.ON if settings.show_resolution else None)
+        self._choice(draw, 680, "Fit recordings", "On" if settings.keep_in_recording else "Off", "keep-in-recording",
+                     fill=self.ON if settings.keep_in_recording else None)
 
-        self._button(draw, (60, 690, 280, 760), "Reset", "reset")
-        self._button(draw, (290, 690, 510, 760), "Update", "update")
-        self._button(draw, (520, 690, 740, 760), "Confirm?" if confirming == "uninstall" else "Uninstall",
+        self._button(draw, (60, 780, 280, 850), "Reset", "reset")
+        self._button(draw, (290, 780, 510, 850), "Update", "update")
+        self._button(draw, (520, 780, 740, 850), "Confirm?" if confirming == "uninstall" else "Uninstall",
                      "uninstall", fill=self.DANGER)
 
         if status:
-            draw.text((self.WIDTH // 2, 800), status, font=self.small_font, fill=YELLOW, anchor="mm")
+            draw.text((self.WIDTH // 2, 890), status, font=self.small_font, fill=YELLOW, anchor="mm")
         return img
 
     def hit(self, x, y):
@@ -675,6 +721,8 @@ def run(on_stable):
 
     enabled = None
     state_mtime = None
+    recorder_view = None        # SFRecorder's view while it records
+    next_recorder_poll = 0.0
     next_update = 0.0
     status = ""
     confirm_action = None  # "uninstall" while waiting for its second click
@@ -709,6 +757,8 @@ def run(on_stable):
             settings.background_alpha = max(0, min(255, settings.background_alpha + step))
         elif action == "resolution":
             settings.show_resolution = not settings.show_resolution
+        elif action == "keep-in-recording":
+            settings.keep_in_recording = not settings.keep_in_recording
         elif action in ("rate-", "rate+"):
             index = UPDATE_RATES_MS.index(settings.update_ms) + (1 if action == "rate+" else -1)
             settings.update_ms = UPDATE_RATES_MS[max(0, min(len(UPDATE_RATES_MS) - 1, index))]
@@ -733,8 +783,12 @@ def run(on_stable):
                 ask_to_confirm("uninstall", "Click again to uninstall")
         if action not in ("toggle", "update", "uninstall"):
             settings.save()
-            hud.configure(settings)
+            hud.configure(settings, recorder_view)
         redraw_menu()
+
+    def hud_visible():
+        # SFRecorder can ask for the HUD to be left out of a recording.
+        return enabled and not (recorder_view and recorder_view.get("hud") == "hide")
 
     hud.configure(settings)
     ticks = 0
@@ -774,7 +828,7 @@ def run(on_stable):
             new_state = read_enabled()
             if new_state != enabled:
                 enabled = new_state
-                hud.set_visible(enabled)
+                hud.set_visible(hud_visible())
                 redraw_menu()
                 next_update = 0.0
 
@@ -783,6 +837,14 @@ def run(on_stable):
             confirm_action = None
             status = ""
             redraw_menu()
+
+        if frame_start >= next_recorder_poll:
+            next_recorder_poll = frame_start + RECORDER_POLL_SECONDS
+            view = read_recorder_view()
+            if view != recorder_view:
+                recorder_view = view
+                hud.configure(settings, recorder_view)
+                hud.set_visible(hud_visible())
 
         if frame_start >= next_refresh_poll:
             next_refresh_poll = frame_start + REFRESH_POLL_SECONDS

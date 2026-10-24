@@ -60,6 +60,7 @@ Everything else is done in the headset. Open the **SteamVR dashboard** and selec
 | **Background** − / + | Changes how dark the background behind the text is |
 | **Update every** − / + | How often the numbers change: 100, 250, 500 or 1000 ms |
 | **Resolution** | Shows or hides the RES row (hidden by default) |
+| **Fit recordings** | While [SFRecorder](https://github.com/MWGIH/SFRecorder) records, moves the panel in just enough to stay inside the recording (on by default). SFRecorder's own tab can also leave the HUD out of a recording; it then disappears from the headset until the recording stops |
 | **Reset** | Puts every option back to its default |
 | **Update** | Downloads the latest version of the overlay (never your games) and restarts it. To avoid problems it won't run while a game is running: exit the game first |
 | **Uninstall** | Removes the overlay and its settings (click twice to confirm) |
