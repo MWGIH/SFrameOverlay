@@ -57,5 +57,5 @@ systemctl --user enable frame-fps-overlay.service
 systemctl --user restart frame-fps-overlay.service
 
 echo
-echo "Done. Put on the headset, open the SteamVR dashboard and pick the 'FPS Overlay' tab"
+echo "Done. Put on the headset, open the SteamVR dashboard and pick the 'VR FPS Overlay' tab"
 echo "to turn the overlay on/off, move it, resize it, change the background, update or uninstall."

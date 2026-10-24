@@ -6,25 +6,20 @@ Shows FPS, frame time, CPU %, GPU %, battery level (with charge icon or current
 draw) and, optionally, resolution in a corner of your view on a semi-opaque
 background.
 
-Mode is chosen in the menu: VR measures the game rendering in VR through the
-SteamVR compositor; Flat measures the flat game shown on the virtual screen
-through gamescope.
+For VR games only: FPS and frame time come from the SteamVR compositor, which
+only sees games rendering in VR. Flat games on the virtual screen aren't measured.
 
-Everything is controlled from one place: the "FPS Overlay" tab in the SteamVR
+Everything is controlled from one place: the "VR FPS Overlay" tab in the SteamVR
 dashboard.
 """
 
-import collections
 import configparser
 import ctypes
-import errno
 import glob
 import os
 import signal
-import struct
 import subprocess
 import sys
-import threading
 import time
 
 import openvr
@@ -45,17 +40,13 @@ TIMING_HISTORY = 256    # frame timings to fetch per refresh (enough for 1 s at 
 CONFIRM_SECONDS = 5.0   # window for the second "Uninstall" click
 STALE_SECONDS = 1.0     # a frame source with nothing newer than this is treated as idle
 REFRESH_POLL_SECONDS = 1.0
-FLAT_POLL_SECONDS = 0.1  # how often gamescope's queue is checked for new streams
-DIAGNOSE_SECONDS = 30.0  # minimum gap between "no flat stats" log reports
 
-MODES = ["vr", "flat"]
 CORNERS = ["top-left", "top-right", "bottom-left", "bottom-right"]
 SIZE_STEP, SIZE_MIN, SIZE_MAX = 0.03, 0.12, 0.48
 ALPHA_STEP = 32
 UPDATE_RATES_MS = [100, 250, 500, 1000]
 
 DEFAULTS = {
-    "mode": "vr",
     "corner": "top-left",
     # Distance from the centre of view to the panel centre, in metres.
     "margin_x": "0.30",
@@ -113,7 +104,6 @@ class Settings:
         cfg["overlay"] = DEFAULTS
         cfg.read(CONFIG_FILE)
         section = cfg["overlay"]
-        self.mode = section.get("mode") if section.get("mode") in MODES else DEFAULTS["mode"]
         self.corner = section.get("corner") if section.get("corner") in CORNERS else DEFAULTS["corner"]
         self.margin_x = section.getfloat("margin_x")
         self.margin_y = section.getfloat("margin_y")
@@ -127,7 +117,6 @@ class Settings:
     def save(self):
         cfg = configparser.ConfigParser()
         cfg["overlay"] = {
-            "mode": self.mode,
             "corner": self.corner,
             "margin_x": f"{self.margin_x:.2f}",
             "margin_y": f"{self.margin_y:.2f}",
@@ -215,236 +204,6 @@ class VRFrameStats:
         intervals = [f.m_flClientFrameIntervalMs for f in recent if f.m_flClientFrameIntervalMs > 0]
         frame_ms = sum(intervals) / len(intervals) if intervals else 1000.0 / fps
         return fps, frame_ms
-
-
-class GamescopeStream:
-    """Frames reported by gamescope for one of its windows (one message stream)."""
-
-    def __init__(self):
-        self.app_frames = collections.deque()      # (received_at, frametime_ns) from the game itself
-        self.visible_frames = collections.deque()  # (received_at, frametime_ns) as shown on screen
-        self.last_seen = 0.0
-        self.steam_focused = True
-        self.resolution = None
-
-    def prune(self, cutoff):
-        for frames in (self.app_frames, self.visible_frames):
-            while frames and frames[0][0] < cutoff:
-                frames.popleft()
-
-    def frames(self):
-        return self.app_frames or self.visible_frames
-
-
-class GamescopeFrameStats:
-    """
-    FPS, frame time and output resolution of a flat game, read from gamescope.
-
-    On the Frame, gamescope shows each flat window as a SteamVR overlay. While Steam's
-    performance overlay is on, gamescope starts a "mangoapp" for each window and sends
-    it that window's frame times on a SysV message queue, one numbered stream per
-    window (see gamescope src/mangoapp.cpp). Without Steam's performance overlay,
-    gamescope sends nothing, so there is nothing to read.
-
-    mangoapp waits on its stream, so the kernel hands each message straight to whoever
-    is waiting. To see the frames at all we wait on each stream too, and every message
-    we take is put straight back for mangoapp. Steam's overlay counts messages to work
-    out its FPS, so it would read low if we kept them.
-    """
-
-    # struct mangoapp_msg_v1 after the `long msg_type` header field, packed.
-    MSG = struct.Struct("<IIQBBQQIIHB40sBBI")
-    NO_VALUE = 2 ** 64 - 1
-    STEAM_FOCUSED_BIT = 0x02
-    # Stream 1 is the legacy single stream; per-window streams are even numbers from 100 up.
-    # Every stream's control channel is its number + 1 and belongs to gamescope, so odd
-    # numbers (other than 1) are never touched.
-    LEGACY_TYPE = 1
-    FIRST_CONNECTOR_TYPE = 100
-    FALLBACK_TYPES = [1] + list(range(100, 142, 2))
-    IPC_NOWAIT = 0o4000
-    MSG_NOERROR = 0o10000
-    MSG_COPY = 0o40000
-    BUF_SIZE = 1016
-    # If a message we put back comes back to us, mangoapp wasn't waiting yet; retry briefly.
-    RETURN_RETRY_SECONDS = 0.001
-    MAX_RETURNS = 40
-    OWN_COPY_SECONDS = 0.05
-
-    def __init__(self):
-        self.libc = ctypes.CDLL(None, use_errno=True)
-        self.libc.msgget.argtypes = [ctypes.c_int, ctypes.c_int]
-        self.libc.msgrcv.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_long, ctypes.c_int]
-        self.libc.msgrcv.restype = ctypes.c_ssize_t
-        self.libc.msgsnd.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
-        self.libc.msgsnd.restype = ctypes.c_int
-        self.peek_buf = ctypes.create_string_buffer(ctypes.sizeof(ctypes.c_long) + self.BUF_SIZE)
-        self.lock = threading.Lock()
-        self.msgid = -1
-        self.next_lookup = 0.0
-        self.next_poll = 0.0
-        self.can_peek = True
-        self.active = False
-        self.readers = {}   # stream number -> thread waiting on it
-        self.streams = {}   # stream number -> GamescopeStream
-        self.last_diagnosis = 0.0
-
-    @staticmethod
-    def _queues():
-        """Rows of /proc/sysvipc/msg as dicts."""
-        text = read_text("/proc/sysvipc/msg")
-        if not text:
-            return []
-        lines = text.splitlines()
-        header = lines[0].split()
-        return [dict(zip(header, line.split())) for line in lines[1:]]
-
-    @staticmethod
-    def _is_gamescope(pid):
-        cmdline = read_text(f"/proc/{pid}/cmdline") or ""
-        return "gamescope" in cmdline.split("\0")[0]
-
-    def _queue(self):
-        if self.msgid >= 0:
-            return self.msgid
-        now = time.monotonic()
-        if now < self.next_lookup:
-            return -1
-        self.next_lookup = now + 5.0
-        # Prefer the queue gamescope last sent to; gamescope keys it with ftok("mangoapp", 65), which is
-        # normally -1 because that file doesn't exist in its working directory.
-        queues = self._queues()
-        chosen = next((q for q in queues if self._is_gamescope(q.get("lspid", "0"))), None)
-        chosen = chosen or next((q for q in queues if q.get("key") == "-1"), None)
-        if chosen:
-            self.msgid = int(chosen["msqid"])
-        return self.msgid
-
-    def _stream_types(self, msgid):
-        """Stream numbers seen in the queue, found by peeking at whatever is waiting without taking it."""
-        if not self.can_peek:
-            return self.FALLBACK_TYPES
-        types = set()
-        index = 0
-        while True:
-            if self.libc.msgrcv(msgid, self.peek_buf, self.BUF_SIZE, index,
-                                self.IPC_NOWAIT | self.MSG_COPY | self.MSG_NOERROR) < 0:
-                if ctypes.get_errno() == errno.ENOSYS:
-                    self.can_peek = False
-                    return self.FALLBACK_TYPES
-                break
-            msg_type = ctypes.c_long.from_buffer(self.peek_buf).value
-            if msg_type == self.LEGACY_TYPE or (msg_type >= self.FIRST_CONNECTOR_TYPE and msg_type % 2 == 0):
-                types.add(msg_type)
-            index += 1
-        return sorted(types)
-
-    def set_active(self, active):
-        """Reading only happens in Flat mode; readers stop after their next message once inactive."""
-        self.active = active
-
-    def poll(self):
-        """Finds gamescope's streams and starts a reader for each new one."""
-        now = time.monotonic()
-        if not self.active or now < self.next_poll:
-            return
-        self.next_poll = now + FLAT_POLL_SECONDS
-        msgid = self._queue()
-        if msgid < 0:
-            return
-        for msg_type in self._stream_types(msgid):
-            reader = self.readers.get(msg_type)
-            if reader is None or not reader.is_alive():
-                reader = threading.Thread(target=self._read_stream, args=(msgid, msg_type), daemon=True)
-                self.readers[msg_type] = reader
-                reader.start()
-
-    def _read_stream(self, msgid, msg_type):
-        """Waits on one stream, records each new frame and hands the message back for mangoapp."""
-        buf = ctypes.create_string_buffer(ctypes.sizeof(ctypes.c_long) + self.BUF_SIZE)
-        offset = ctypes.sizeof(ctypes.c_long)
-        # Message bytes we put back -> (when, times it came back to us). A steady frame rate can make
-        # gamescope send identical messages, so a match only counts as our own copy for a short while.
-        forwarded = collections.OrderedDict()
-        while True:
-            received = self.libc.msgrcv(msgid, buf, self.BUF_SIZE, msg_type, self.MSG_NOERROR)
-            if received < 0:
-                if ctypes.get_errno() == errno.EINTR:
-                    continue
-                with self.lock:
-                    self.msgid = -1
-                return
-            now = time.monotonic()
-            while forwarded and now - next(iter(forwarded.values()))[0] > self.OWN_COPY_SECONDS:
-                forwarded.popitem(last=False)
-            data = buf.raw[:offset + received]
-            if data in forwarded:
-                # Our own copy came back before mangoapp picked it up: give it another moment.
-                # With no mangoapp left (Steam's overlay closed) it would keep coming back; drop it then.
-                _, returns = forwarded.pop(data)
-                if returns >= self.MAX_RETURNS:
-                    continue
-                forwarded[data] = (now, returns + 1)
-                time.sleep(self.RETURN_RETRY_SECONDS)
-            else:
-                self._record(msg_type, buf.raw, offset, received)
-                forwarded[data] = (now, 0)
-            self.libc.msgsnd(msgid, buf, received, self.IPC_NOWAIT)
-            if not self.active:
-                return
-
-    def _record(self, msg_type, raw, offset, size):
-        if size < self.MSG.size:
-            return
-        (version, _pid, app_ns, _fsr, _sharp, visible_ns, _latency, width, height,
-         _refresh, flags, _engine, _up, _wanted, _scanout) = self.MSG.unpack_from(raw, offset)
-        if version != 1:
-            return
-        now = time.monotonic()
-        with self.lock:
-            stream = self.streams.setdefault(msg_type, GamescopeStream())
-            stream.last_seen = now
-            stream.steam_focused = bool(flags & self.STEAM_FOCUSED_BIT)
-            if width and height:
-                stream.resolution = (width, height)
-            if app_ns != self.NO_VALUE and 0 < app_ns < 1_000_000_000:
-                stream.app_frames.append((now, app_ns))
-            if visible_ns != self.NO_VALUE and 0 < visible_ns < 1_000_000_000:
-                stream.visible_frames.append((now, visible_ns))
-
-    def sample(self, window):
-        """Returns ((fps, frame_time_ms), resolution) for the busiest game window, or (None, None)."""
-        now = time.monotonic()
-        with self.lock:
-            live = []
-            for stream in self.streams.values():
-                stream.prune(now - window)
-                if now - stream.last_seen < STALE_SECONDS and stream.frames():
-                    live.append(stream)
-            if live:
-                # The game is the window that isn't Steam's own UI and is presenting the most frames.
-                best = max(live, key=lambda s: (not s.steam_focused, len(s.frames())))
-                frames = list(best.frames())
-                resolution = best.resolution
-        if not live:
-            self._diagnose()
-            return None, None
-        mean_ns = sum(ns for _, ns in frames) / len(frames)
-        return (1e9 / mean_ns, mean_ns / 1e6), resolution
-
-    def _diagnose(self):
-        """Logs what is available so a missing flat-game feed can be tracked down from the journal."""
-        now = time.monotonic()
-        if now - self.last_diagnosis < DIAGNOSE_SECONDS:
-            return
-        self.last_diagnosis = now
-        queues = [f"msqid={q.get('msqid')} key={q.get('key')} qnum={q.get('qnum')} "
-                  f"lspid={q.get('lspid')} lrpid={q.get('lrpid')}" for q in self._queues()]
-        mangoapps = sum(1 for path in glob.glob("/proc/[0-9]*/cmdline")
-                        if (read_text(path) or "").split("\0")[0].endswith("mangoapp"))
-        log(f"Flat mode: no gamescope frame stats. queue={self.msgid} peek={self.can_peek} "
-            f"readers={sorted(t for t, r in self.readers.items() if r.is_alive())} queues={queues or 'none'} "
-            f"mangoapp processes={mangoapps} (0 means Steam's performance overlay is off, so gamescope sends nothing)")
 
 
 class CpuStats:
@@ -604,7 +363,7 @@ class Hud:
     the start of a frame. The background never changes during play, so it can't flicker.
 
     SteamVR has a small shared limit on overlays (128 for everything on the headset,
-    including gamescope's flat-game windows and the dashboard), so the HUD deliberately
+    including Steam's own windows and the dashboard), so the HUD deliberately
     stays at three.
     """
 
@@ -618,7 +377,6 @@ class Hud:
     def __init__(self, overlay):
         self.overlay = overlay
         self.font = load_font(40)
-        self.tag_font = load_font(22)
         self.advance = self.font.getlength("0")
         self.background = overlay.createOverlay(APP_KEY + ".hud", "FPS Overlay HUD")
         overlay.setOverlaySortOrder(self.background, 100)
@@ -629,7 +387,7 @@ class Hud:
         self.front_loaded = False
         self.loading_since = None   # frame counter when the back layer's texture was sent
         self.visible = False
-        self.layout_key = None      # (alpha, mode, rows) the background was drawn for
+        self.layout_key = None      # (alpha, rows) the background was drawn for
         self.rows = []
         self.values = None
         self.text_key = None        # (rows, values) last sent to a text layer
@@ -638,10 +396,10 @@ class Hud:
     def configure(self, settings):
         """Applies placement, size and background. The background is only redrawn if its look changed."""
         self.rows = [label for label in self.ROWS if settings.show_resolution or label != "RES"]
-        layout_key = (settings.background_alpha, settings.mode, tuple(self.rows))
+        layout_key = (settings.background_alpha, tuple(self.rows))
         if layout_key != self.layout_key:
             self.layout_key = layout_key
-            img = self._render_background(settings.background_alpha, settings.mode)
+            img = self._render_background(settings.background_alpha)
             self.overlay.setOverlayRaw(self.background, to_texture(img), img.width, img.height, 4)
         for handle in [self.background, *self.text]:
             self.overlay.setOverlayWidthInMeters(handle, settings.width_m)
@@ -693,11 +451,10 @@ class Hud:
     def _row_centre(self, row):
         return self.PADDING + self.LINE * row + self.LINE / 2
 
-    def _render_background(self, alpha, mode):
+    def _render_background(self, alpha):
         img = Image.new("RGBA", (self.WIDTH, self._height()), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
         draw.rounded_rectangle((0, 0, self.WIDTH - 1, img.height - 1), radius=22, fill=(0, 0, 0, alpha))
-        draw.text((self.WIDTH - 18, 16), mode.upper(), font=self.tag_font, fill=GREY, anchor="ra")
         for row, label in enumerate(self.rows):
             # Thin dark stroke keeps the text readable even against bright scenes.
             draw.text((self.X_LABEL, self._row_centre(row)), label, font=self.font, fill=GREY, anchor="lm",
@@ -719,9 +476,9 @@ class Hud:
                               stroke_width=2, stroke_fill=OUTLINE)
         return img
 
-    def render(self, alpha, mode, values):
+    def render(self, alpha, values):
         """The full panel as one image (background + text), for previews and tests."""
-        img = self._render_background(alpha, mode)
+        img = self._render_background(alpha)
         img.alpha_composite(self._render_text(values))
         return img
 
@@ -776,7 +533,7 @@ def format_values(frame, refresh_hz, cpu, gpu, battery, resolution):
 
 class Menu:
     """The 'FPS Overlay' tab in the SteamVR dashboard: every option for the overlay in one place."""
-    WIDTH, HEIGHT = 800, 930
+    WIDTH, HEIGHT = 800, 840
     BG = (24, 26, 32, 255)
     BUTTON = (58, 62, 74, 255)
     ON = (40, 170, 80, 255)
@@ -811,26 +568,25 @@ class Menu:
         self.buttons = []
         img = Image.new("RGBA", (self.WIDTH, self.HEIGHT), self.BG)
         draw = ImageDraw.Draw(img)
-        draw.text((self.WIDTH // 2, 50), "FPS Overlay", font=self.title_font, fill=WHITE, anchor="mm")
+        draw.text((self.WIDTH // 2, 50), "VR FPS Overlay", font=self.title_font, fill=WHITE, anchor="mm")
 
         self._button(draw, (60, 100, 740, 200), "ON" if enabled else "OFF", "toggle",
                      fill=self.ON if enabled else self.OFF, font=self.big_font)
 
-        self._choice(draw, 230, "Measure", "VR game" if settings.mode == "vr" else "Flat game", "mode")
-        self._choice(draw, 320, "Position", settings.corner.replace("-", " ").capitalize(), "corner")
-        self._row(draw, 410, "Size", f"{round(settings.width_m * 100)} cm", "size-", "size+")
-        self._row(draw, 500, "Background", f"{round(settings.background_alpha / 255 * 100)}%", "bg-", "bg+")
-        self._row(draw, 590, "Update every", f"{settings.update_ms} ms", "rate-", "rate+")
-        self._choice(draw, 680, "Resolution", "Shown" if settings.show_resolution else "Hidden", "resolution",
+        self._choice(draw, 230, "Position", settings.corner.replace("-", " ").capitalize(), "corner")
+        self._row(draw, 320, "Size", f"{round(settings.width_m * 100)} cm", "size-", "size+")
+        self._row(draw, 410, "Background", f"{round(settings.background_alpha / 255 * 100)}%", "bg-", "bg+")
+        self._row(draw, 500, "Update every", f"{settings.update_ms} ms", "rate-", "rate+")
+        self._choice(draw, 590, "Resolution", "Shown" if settings.show_resolution else "Hidden", "resolution",
                      fill=self.ON if settings.show_resolution else None)
 
-        self._button(draw, (60, 780, 280, 850), "Reset", "reset")
-        self._button(draw, (290, 780, 510, 850), "Update", "update")
-        self._button(draw, (520, 780, 740, 850), "Confirm?" if confirming == "uninstall" else "Uninstall",
+        self._button(draw, (60, 690, 280, 760), "Reset", "reset")
+        self._button(draw, (290, 690, 510, 760), "Update", "update")
+        self._button(draw, (520, 690, 740, 760), "Confirm?" if confirming == "uninstall" else "Uninstall",
                      "uninstall", fill=self.DANGER)
 
         if status:
-            draw.text((self.WIDTH // 2, 890), status, font=self.small_font, fill=YELLOW, anchor="mm")
+            draw.text((self.WIDTH // 2, 800), status, font=self.small_font, fill=YELLOW, anchor="mm")
         return img
 
     def hit(self, x, y):
@@ -904,12 +660,11 @@ def run(on_stable):
     vr_system = openvr.init(openvr.VRApplication_Overlay)
     overlay = openvr.VROverlay()
     vr_frames = VRFrameStats(openvr.VRCompositor())
-    flat_frames = GamescopeFrameStats()
     cpu_stats, gpu_stats, battery_stats = CpuStats(), GpuStats(), BatteryStats(vr_system)
     hud = Hud(overlay)
     menu = Menu()
 
-    menu_handle, thumb_handle = overlay.createDashboardOverlay(APP_KEY + ".dashboard", "FPS Overlay")
+    menu_handle, thumb_handle = overlay.createDashboardOverlay(APP_KEY + ".dashboard", "VR FPS Overlay")
     overlay.setOverlayWidthInMeters(menu_handle, 1.5)
     overlay.setOverlayInputMethod(menu_handle, openvr.VROverlayInputMethod_Mouse)
     mouse_scale = openvr.HmdVector2_t()
@@ -944,8 +699,6 @@ def run(on_stable):
         status = ""
         if action == "toggle":
             write_enabled(not enabled)
-        elif action == "mode":
-            settings.mode = MODES[(MODES.index(settings.mode) + 1) % len(MODES)]
         elif action == "corner":
             settings.corner = CORNERS[(CORNERS.index(settings.corner) + 1) % len(CORNERS)]
         elif action in ("size-", "size+"):
@@ -1035,18 +788,12 @@ def run(on_stable):
             next_refresh_poll = frame_start + REFRESH_POLL_SECONDS
             refresh_hz = display_refresh_hz(vr_system) or refresh_hz
 
-        flat_frames.set_active(settings.mode == "flat")
-        flat_frames.poll()
-
         if enabled and frame_start >= next_update:
             window = settings.update_ms / 1000
             next_update = frame_start + window
-            if settings.mode == "flat":
-                frame, resolution = flat_frames.sample(window)
-            else:
-                frame = vr_frames.sample(window)
-                width, height = vr_system.getRecommendedRenderTargetSize()
-                resolution = (width, height) if width and height else None
+            frame = vr_frames.sample(window)
+            width, height = vr_system.getRecommendedRenderTargetSize()
+            resolution = (width, height) if width and height else None
             hud.show_values(format_values(frame, refresh_hz, cpu_stats.percent(), gpu_stats.percent(),
                                           battery_stats.read(), resolution))
 

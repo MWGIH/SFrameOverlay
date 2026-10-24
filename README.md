@@ -1,9 +1,9 @@
 # Frame FPS Overlay
 
-A small performance HUD for the Steam Frame that stays in a corner of your view (upper-left by default):
+A small performance HUD **for VR games** on the Steam Frame. It stays in a corner of your view (upper-left by default):
 
 ```
-FPS  90                    VR
+FPS  90
 FT   11.2 ms
 CPU  42%
 GPU  77%
@@ -11,15 +11,15 @@ BAT  78% ⚡          (charging)
 ```
 
 ```
-FPS  59                  FLAT
-FT   17.0 ms
+FPS  72
+FT   13.9 ms
 CPU  93%
 GPU  61%
 BAT  24% 1450mA      (on battery: current draw)
-RES  1920x1080       (only when Resolution is turned on in the menu)
+RES  2016x2240       (only when Resolution is turned on in the menu)
 ```
 
-- Measures **VR games** or **flat games** on the virtual screen; pick which in the menu, and the corner tag shows the current choice
+- **VR games only.** FPS and frame time come from SteamVR, which only sees games rendering in VR. For flat games on the virtual screen, use Steam's own performance overlay instead.
 - Semi-opaque black rounded background with outlined text, readable on bright scenes
 - Flicker-free updates, synced to the display's refresh rate: the background never changes during play, and new numbers are drawn on a hidden layer, given 2 frames to load, then swapped in right after a vsync
 - Uses just 3 SteamVR overlays for the panel, staying well within SteamVR's shared overlay limit
@@ -50,12 +50,11 @@ If this repo is private, `git clone` will ask you to sign in to GitHub. Use a [p
 
 ## The menu
 
-Everything else is done in the headset. Open the **SteamVR dashboard** and select the **FPS Overlay** tab:
+Everything else is done in the headset. Open the **SteamVR dashboard** and select the **VR FPS Overlay** tab:
 
 | Option | What it does |
 |---|---|
 | **ON / OFF** | Shows or hides the overlay |
-| **Measure** | **VR game** (default) or **Flat game**: switch to Flat game while playing a flat game on the virtual screen. Flat game also needs Steam's own performance overlay switched on (see below) |
 | **Position** | Cycles through top left, top right, bottom left and bottom right |
 | **Size** − / + | Makes the panel smaller or larger |
 | **Background** − / + | Changes how dark the background behind the text is |
@@ -67,22 +66,15 @@ Everything else is done in the headset. Open the **SteamVR dashboard** and selec
 
 Changes apply straight away and are remembered between sessions.
 
-### Flat games need Steam's performance overlay on
-
-On the Frame, gamescope (which shows flat games on the virtual screen) only sends out a game's frame times while Steam's own performance overlay is running for that game. Turn Steam's performance overlay on, at any level, and FPS / FT will appear in **Flat game** mode. Without it there is nothing to read, and FPS / FT show `--`.
-
-Both overlays then read the same frame times. Every one this overlay reads is passed straight on to Steam's, so Steam's numbers aren't affected.
-
 ## What the numbers mean
 
 | Field | Source |
 |---|---|
-| FPS / FT (VR) | Frames the VR game submitted to the SteamVR compositor, averaged over the update interval |
-| FPS / FT (FLAT) | Frame times gamescope reports for the flat game it is showing on the virtual screen (the same feed Steam's own performance overlay uses) |
+| FPS / FT | Frames the VR game submitted to the SteamVR compositor, averaged over the update interval |
 | CPU | Overall CPU use from `/proc/stat` |
 | GPU | GPU busy time from the graphics driver's per-process stats (`/proc/*/fdinfo`), taken from the busiest process |
 | BAT | Headset battery %; while on battery, current draw from `/sys/class/power_supply` |
-| RES (optional) | VR: SteamVR's per-eye render size. Flat: the resolution gamescope outputs the game at |
+| RES (optional) | SteamVR's per-eye render size, which includes your render-resolution setting |
 
 ## Troubleshooting
 
@@ -102,19 +94,10 @@ systemctl --user disable --now frame-fps-overlay.service
 
 The overlay also has its own guard. If it fails to keep running for a minute twice in a row, it stays off, and the log says `Not starting`. Running the install line again clears this and turns it back on.
 
-### Flat game stats
-
-If FPS stays at `--` in **Flat game** mode, start a flat game, set the overlay to **Flat game**, wait about 30 seconds, then run:
-
-```bash
-~/SFrameOverlay/diagnose.sh
-```
-
-It only reads information and changes nothing. The report is printed and saved to `~/frame-overlay-diagnostics.txt`.
-
 ## Limitations
 
-- Flat-game FPS needs Steam's performance overlay on; see "Flat games need Steam's performance overlay on".
+- VR games only. With a flat game on the virtual screen, FPS / FT show the virtual screen itself, not the game; use Steam's performance overlay for flat games.
+- RES is the resolution SteamVR asks VR games to render at. A game that picks its own resolution can differ from it.
 - GPU % is an estimate. The Frame's driver only reports busy time per process, and that time includes moments when another job interrupted it, so the busiest process is shown rather than a true total.
 - Battery draw is current (mA). mAh is battery capacity, not draw, so it isn't shown.
 - Update from the menu needs the repo to be public, or GitHub sign-in saved on the headset. Otherwise, re-run the install line.
