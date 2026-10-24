@@ -24,6 +24,7 @@ import signal
 import struct
 import subprocess
 import sys
+import threading
 import time
 
 import openvr
@@ -44,7 +45,7 @@ TIMING_HISTORY = 256    # frame timings to fetch per refresh (enough for 1 s at 
 CONFIRM_SECONDS = 5.0   # window for the second "Uninstall" click
 STALE_SECONDS = 1.0     # a frame source with nothing newer than this is treated as idle
 REFRESH_POLL_SECONDS = 1.0
-FLAT_POLL_SECONDS = 0.1  # how often gamescope's stats queue is drained
+FLAT_POLL_SECONDS = 0.1  # how often gamescope's queue is checked for new streams
 DIAGNOSE_SECONDS = 30.0  # minimum gap between "no flat stats" log reports
 
 MODES = ["vr", "flat"]
@@ -239,11 +240,16 @@ class GamescopeFrameStats:
     """
     FPS, frame time and output resolution of a flat game, read from gamescope.
 
-    On the Frame, gamescope shows each flat window as a SteamVR overlay and publishes
-    per-frame stats for MangoHud's "mangoapp" on a SysV message queue, one stream per
-    window (see gamescope src/mangoapp.cpp). We read the same messages. If Steam's own
-    performance overlay is also reading them we only see some of the frames, which is
-    fine because each message carries its own frame time.
+    On the Frame, gamescope shows each flat window as a SteamVR overlay. While Steam's
+    performance overlay is on, gamescope starts a "mangoapp" for each window and sends
+    it that window's frame times on a SysV message queue, one numbered stream per
+    window (see gamescope src/mangoapp.cpp). Without Steam's performance overlay,
+    gamescope sends nothing, so there is nothing to read.
+
+    mangoapp waits on its stream, so the kernel hands each message straight to whoever
+    is waiting. To see the frames at all we wait on each stream too, and every message
+    we take is put straight back for mangoapp. Steam's overlay counts messages to work
+    out its FPS, so it would read low if we kept them.
     """
 
     # struct mangoapp_msg_v1 after the `long msg_type` header field, packed.
@@ -252,27 +258,35 @@ class GamescopeFrameStats:
     STEAM_FOCUSED_BIT = 0x02
     # Stream 1 is the legacy single stream; per-window streams are even numbers from 100 up.
     # Every stream's control channel is its number + 1 and belongs to gamescope, so odd
-    # numbers (other than 1) are never consumed.
+    # numbers (other than 1) are never touched.
     LEGACY_TYPE = 1
     FIRST_CONNECTOR_TYPE = 100
-    FALLBACK_TYPES = [1] + list(range(100, 400, 2))
+    FALLBACK_TYPES = [1] + list(range(100, 142, 2))
     IPC_NOWAIT = 0o4000
     MSG_NOERROR = 0o10000
     MSG_COPY = 0o40000
     BUF_SIZE = 1016
+    # If a message we put back comes back to us, mangoapp wasn't waiting yet; retry briefly.
+    RETURN_RETRY_SECONDS = 0.001
+    MAX_RETURNS = 40
+    OWN_COPY_SECONDS = 0.05
 
     def __init__(self):
         self.libc = ctypes.CDLL(None, use_errno=True)
         self.libc.msgget.argtypes = [ctypes.c_int, ctypes.c_int]
         self.libc.msgrcv.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_long, ctypes.c_int]
         self.libc.msgrcv.restype = ctypes.c_ssize_t
-        self.buf = ctypes.create_string_buffer(ctypes.sizeof(ctypes.c_long) + self.BUF_SIZE)
+        self.libc.msgsnd.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+        self.libc.msgsnd.restype = ctypes.c_int
+        self.peek_buf = ctypes.create_string_buffer(ctypes.sizeof(ctypes.c_long) + self.BUF_SIZE)
+        self.lock = threading.Lock()
         self.msgid = -1
         self.next_lookup = 0.0
         self.next_poll = 0.0
-        self.discard_backlog = True
         self.can_peek = True
-        self.streams = {}
+        self.active = False
+        self.readers = {}   # stream number -> thread waiting on it
+        self.streams = {}   # stream number -> GamescopeStream
         self.last_diagnosis = 0.0
 
     @staticmethod
@@ -304,84 +318,119 @@ class GamescopeFrameStats:
         chosen = chosen or next((q for q in queues if q.get("key") == "-1"), None)
         if chosen:
             self.msgid = int(chosen["msqid"])
-            self.discard_backlog = True
         return self.msgid
 
     def _stream_types(self, msgid):
-        """The data stream numbers currently waiting in the queue, found by peeking without consuming."""
+        """Stream numbers seen in the queue, found by peeking at whatever is waiting without taking it."""
         if not self.can_peek:
             return self.FALLBACK_TYPES
         types = set()
         index = 0
         while True:
-            if self.libc.msgrcv(msgid, self.buf, self.BUF_SIZE, index,
+            if self.libc.msgrcv(msgid, self.peek_buf, self.BUF_SIZE, index,
                                 self.IPC_NOWAIT | self.MSG_COPY | self.MSG_NOERROR) < 0:
                 if ctypes.get_errno() == errno.ENOSYS:
                     self.can_peek = False
                     return self.FALLBACK_TYPES
                 break
-            msg_type = ctypes.c_long.from_buffer(self.buf).value
+            msg_type = ctypes.c_long.from_buffer(self.peek_buf).value
             if msg_type == self.LEGACY_TYPE or (msg_type >= self.FIRST_CONNECTOR_TYPE and msg_type % 2 == 0):
                 types.add(msg_type)
             index += 1
         return sorted(types)
 
+    def set_active(self, active):
+        """Reading only happens in Flat mode; readers stop after their next message once inactive."""
+        self.active = active
+
     def poll(self):
-        """Drains new gamescope messages. Call often so the queue never fills up."""
+        """Finds gamescope's streams and starts a reader for each new one."""
         now = time.monotonic()
-        if now < self.next_poll:
+        if not self.active or now < self.next_poll:
             return
-        # After a gap (start-up, or switching to Flat mode) the queue holds old frames; skip them.
-        if now - self.next_poll > 1.0:
-            self.discard_backlog = True
         self.next_poll = now + FLAT_POLL_SECONDS
         msgid = self._queue()
         if msgid < 0:
             return
-        offset = ctypes.sizeof(ctypes.c_long)
         for msg_type in self._stream_types(msgid):
+            reader = self.readers.get(msg_type)
+            if reader is None or not reader.is_alive():
+                reader = threading.Thread(target=self._read_stream, args=(msgid, msg_type), daemon=True)
+                self.readers[msg_type] = reader
+                reader.start()
+
+    def _read_stream(self, msgid, msg_type):
+        """Waits on one stream, records each new frame and hands the message back for mangoapp."""
+        buf = ctypes.create_string_buffer(ctypes.sizeof(ctypes.c_long) + self.BUF_SIZE)
+        offset = ctypes.sizeof(ctypes.c_long)
+        # Message bytes we put back -> (when, times it came back to us). A steady frame rate can make
+        # gamescope send identical messages, so a match only counts as our own copy for a short while.
+        forwarded = collections.OrderedDict()
+        while True:
+            received = self.libc.msgrcv(msgid, buf, self.BUF_SIZE, msg_type, self.MSG_NOERROR)
+            if received < 0:
+                if ctypes.get_errno() == errno.EINTR:
+                    continue
+                with self.lock:
+                    self.msgid = -1
+                return
+            now = time.monotonic()
+            while forwarded and now - next(iter(forwarded.values()))[0] > self.OWN_COPY_SECONDS:
+                forwarded.popitem(last=False)
+            data = buf.raw[:offset + received]
+            if data in forwarded:
+                # Our own copy came back before mangoapp picked it up: give it another moment.
+                # With no mangoapp left (Steam's overlay closed) it would keep coming back; drop it then.
+                _, returns = forwarded.pop(data)
+                if returns >= self.MAX_RETURNS:
+                    continue
+                forwarded[data] = (now, returns + 1)
+                time.sleep(self.RETURN_RETRY_SECONDS)
+            else:
+                self._record(msg_type, buf.raw, offset, received)
+                forwarded[data] = (now, 0)
+            self.libc.msgsnd(msgid, buf, received, self.IPC_NOWAIT)
+            if not self.active:
+                return
+
+    def _record(self, msg_type, raw, offset, size):
+        if size < self.MSG.size:
+            return
+        (version, _pid, app_ns, _fsr, _sharp, visible_ns, _latency, width, height,
+         _refresh, flags, _engine, _up, _wanted, _scanout) = self.MSG.unpack_from(raw, offset)
+        if version != 1:
+            return
+        now = time.monotonic()
+        with self.lock:
             stream = self.streams.setdefault(msg_type, GamescopeStream())
-            while True:
-                received = self.libc.msgrcv(msgid, self.buf, self.BUF_SIZE, msg_type,
-                                            self.IPC_NOWAIT | self.MSG_NOERROR)
-                if received < 0:
-                    if ctypes.get_errno() in (errno.EIDRM, errno.EINVAL):
-                        self.msgid = -1
-                        return
-                    break
-                if received < self.MSG.size or self.discard_backlog:
-                    continue
-                (version, _pid, app_ns, _fsr, _sharp, visible_ns, _latency, width, height,
-                 _refresh, flags, _engine, _up, _wanted, _scanout) = self.MSG.unpack_from(self.buf.raw, offset)
-                if version != 1:
-                    continue
-                stream.last_seen = now
-                stream.steam_focused = bool(flags & self.STEAM_FOCUSED_BIT)
-                if width and height:
-                    stream.resolution = (width, height)
-                if app_ns != self.NO_VALUE and 0 < app_ns < 1_000_000_000:
-                    stream.app_frames.append((now, app_ns))
-                if visible_ns != self.NO_VALUE and 0 < visible_ns < 1_000_000_000:
-                    stream.visible_frames.append((now, visible_ns))
-        # Whatever was queued before we attached is old; only count frames from here on.
-        self.discard_backlog = False
+            stream.last_seen = now
+            stream.steam_focused = bool(flags & self.STEAM_FOCUSED_BIT)
+            if width and height:
+                stream.resolution = (width, height)
+            if app_ns != self.NO_VALUE and 0 < app_ns < 1_000_000_000:
+                stream.app_frames.append((now, app_ns))
+            if visible_ns != self.NO_VALUE and 0 < visible_ns < 1_000_000_000:
+                stream.visible_frames.append((now, visible_ns))
 
     def sample(self, window):
         """Returns ((fps, frame_time_ms), resolution) for the busiest game window, or (None, None)."""
         now = time.monotonic()
-        live = []
-        for stream in self.streams.values():
-            stream.prune(now - window)
-            if now - stream.last_seen < STALE_SECONDS and stream.frames():
-                live.append(stream)
+        with self.lock:
+            live = []
+            for stream in self.streams.values():
+                stream.prune(now - window)
+                if now - stream.last_seen < STALE_SECONDS and stream.frames():
+                    live.append(stream)
+            if live:
+                # The game is the window that isn't Steam's own UI and is presenting the most frames.
+                best = max(live, key=lambda s: (not s.steam_focused, len(s.frames())))
+                frames = list(best.frames())
+                resolution = best.resolution
         if not live:
             self._diagnose()
             return None, None
-        # The game is the window that isn't Steam's own UI and is presenting the most frames.
-        best = max(live, key=lambda s: (not s.steam_focused, len(s.frames())))
-        frames = best.frames()
         mean_ns = sum(ns for _, ns in frames) / len(frames)
-        return (1e9 / mean_ns, mean_ns / 1e6), best.resolution
+        return (1e9 / mean_ns, mean_ns / 1e6), resolution
 
     def _diagnose(self):
         """Logs what is available so a missing flat-game feed can be tracked down from the journal."""
@@ -391,13 +440,11 @@ class GamescopeFrameStats:
         self.last_diagnosis = now
         queues = [f"msqid={q.get('msqid')} key={q.get('key')} qnum={q.get('qnum')} "
                   f"lspid={q.get('lspid')} lrpid={q.get('lrpid')}" for q in self._queues()]
-        gamescopes = []
-        for path in glob.glob("/proc/[0-9]*/cmdline"):
-            args = (read_text(path) or "").split("\0")
-            if args and "gamescope" in args[0]:
-                gamescopes.append(" ".join(args)[:300])
-        log(f"Flat mode: no gamescope frame stats. attached queue={self.msgid} peek={self.can_peek} "
-            f"streams={sorted(self.streams)} queues={queues or 'none'} gamescope={gamescopes or 'not running'}")
+        mangoapps = sum(1 for path in glob.glob("/proc/[0-9]*/cmdline")
+                        if (read_text(path) or "").split("\0")[0].endswith("mangoapp"))
+        log(f"Flat mode: no gamescope frame stats. queue={self.msgid} peek={self.can_peek} "
+            f"readers={sorted(t for t, r in self.readers.items() if r.is_alive())} queues={queues or 'none'} "
+            f"mangoapp processes={mangoapps} (0 means Steam's performance overlay is off, so gamescope sends nothing)")
 
 
 class CpuStats:
@@ -988,8 +1035,8 @@ def run(on_stable):
             next_refresh_poll = frame_start + REFRESH_POLL_SECONDS
             refresh_hz = display_refresh_hz(vr_system) or refresh_hz
 
-        if settings.mode == "flat":
-            flat_frames.poll()
+        flat_frames.set_active(settings.mode == "flat")
+        flat_frames.poll()
 
         if enabled and frame_start >= next_update:
             window = settings.update_ms / 1000

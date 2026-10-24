@@ -55,7 +55,7 @@ Everything else is done in the headset. Open the **SteamVR dashboard** and selec
 | Option | What it does |
 |---|---|
 | **ON / OFF** | Shows or hides the overlay |
-| **Measure** | **VR game** (default) or **Flat game**: switch to Flat game while playing a flat game on the virtual screen |
+| **Measure** | **VR game** (default) or **Flat game**: switch to Flat game while playing a flat game on the virtual screen. Flat game also needs Steam's own performance overlay switched on (see below) |
 | **Position** | Cycles through top left, top right, bottom left and bottom right |
 | **Size** − / + | Makes the panel smaller or larger |
 | **Background** − / + | Changes how dark the background behind the text is |
@@ -66,6 +66,12 @@ Everything else is done in the headset. Open the **SteamVR dashboard** and selec
 | **Uninstall** | Removes the overlay and its settings (click twice to confirm) |
 
 Changes apply straight away and are remembered between sessions.
+
+### Flat games need Steam's performance overlay on
+
+On the Frame, gamescope (which shows flat games on the virtual screen) only sends out a game's frame times while Steam's own performance overlay is running for that game. Turn Steam's performance overlay on, at any level, and FPS / FT will appear in **Flat game** mode. Without it there is nothing to read, and FPS / FT show `--`.
+
+Both overlays then read the same frame times. Every one this overlay reads is passed straight on to Steam's, so Steam's numbers aren't affected.
 
 ## What the numbers mean
 
@@ -108,7 +114,7 @@ It only reads information and changes nothing. The report is printed and saved t
 
 ## Limitations
 
-- Flat-game stats share gamescope's feed with Steam's built-in performance overlay. If you turn that on as well, both still work, but each only sees some of the frames, so Steam's own overlay may read a little off.
+- Flat-game FPS needs Steam's performance overlay on; see "Flat games need Steam's performance overlay on".
 - GPU % is an estimate. The Frame's driver only reports busy time per process, and that time includes moments when another job interrupted it, so the busiest process is shown rather than a true total.
 - Battery draw is current (mA). mAh is battery capacity, not draw, so it isn't shown.
 - Update from the menu needs the repo to be public, or GitHub sign-in saved on the headset. Otherwise, re-run the install line.
