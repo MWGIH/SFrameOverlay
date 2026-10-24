@@ -76,6 +76,21 @@ Changes apply straight away and are remembered between sessions.
 | BAT | Headset battery %; while on battery, current draw from `/sys/class/power_supply` |
 | RES (optional) | SteamVR's per-eye render size, which includes your render-resolution setting |
 
+## Getting recordings onto your PC (preview)
+
+`share_server.py` lets any browser on the same Wi-Fi play, download and delete the Frame's recordings. Nothing needs installing on the PC. It will become a **Share recordings** switch in the dashboard tab once the recorder is in. Until then you can try it from Konsole:
+
+```bash
+python3 ~/SFrameOverlay/share_server.py
+```
+
+It prints two addresses and a 4-digit PIN. Open either address on your PC or phone and enter the PIN. You can play a recording in the browser, download it, tick several to download as one zip, or delete them.
+
+- It shares `~/Videos/framecorder` and its `clips` folder by default; use `--dir` for another folder.
+- Recordings still being written (`.part` files) are hidden until they finish.
+- It stops after 30 minutes without use, or when you press Ctrl+C.
+- If the `.local` address doesn't open, use the one with the number (IP address).
+
 ## Troubleshooting
 
 If the overlay or its tab doesn't show up, or a value stays at `--`, this prints its log:
