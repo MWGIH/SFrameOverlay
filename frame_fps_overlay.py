@@ -69,11 +69,14 @@ FONT_CANDIDATES = [
 ]
 
 WHITE = (255, 255, 255, 255)
-GREY = (170, 170, 170, 255)
+GREY = (147, 154, 166, 255)
 GREEN = (80, 230, 110, 255)
 YELLOW = (255, 210, 60, 255)
 RED = (255, 80, 80, 255)
 OUTLINE = (0, 0, 0, 255)
+# Gaming on Steam site colours: logo blue, card blue.
+BLUE = (24, 157, 255, 255)
+CARD = (24, 47, 103, 255)
 
 
 def log(message):
@@ -534,11 +537,11 @@ def format_values(frame, refresh_hz, cpu, gpu, battery, resolution):
 class Menu:
     """The 'FPS Overlay' tab in the SteamVR dashboard: every option for the overlay in one place."""
     WIDTH, HEIGHT = 800, 840
-    BG = (24, 26, 32, 255)
-    BUTTON = (58, 62, 74, 255)
-    ON = (40, 170, 80, 255)
-    OFF = (120, 40, 40, 255)
-    DANGER = (150, 50, 50, 255)
+    BG = (0, 0, 0, 255)
+    BUTTON = CARD
+    ON = BLUE
+    OFF = (120, 30, 40, 255)
+    DANGER = (190, 20, 20, 255)
 
     def __init__(self):
         self.title_font = load_font(52)
@@ -597,9 +600,9 @@ class Menu:
 
     @staticmethod
     def thumbnail():
-        img = Image.new("RGBA", (256, 256), Menu.BG)
+        img = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
-        draw.text((128, 128), "FPS", font=load_font(96), fill=GREEN, anchor="mm")
+        draw.text((128, 128), "FPS", font=load_font(96), fill=BLUE, anchor="mm")
         return img
 
 
