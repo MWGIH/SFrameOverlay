@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Installs (or updates) Frame FPS Overlay for the current user. No root, no Decky Loader needed.
-# All options are in the "FPS Overlay" tab of the SteamVR dashboard once installed.
+# All options are in the "VR FPS Overlay" tab of the SteamVR dashboard once installed.
 set -euo pipefail
 
 PYOPENVR_VERSION="2.12.1401"
