@@ -89,6 +89,7 @@ It prints two addresses and a 4-digit PIN. Open either address on your PC or pho
 - It shares `~/Videos/framecorder` and its `clips` folder by default; use `--dir` for another folder.
 - Recordings still being written (`.part` files) are hidden until they finish.
 - It stops after 30 minutes without use, or when you press Ctrl+C.
+- Uninstalling the overlay also stops sharing and deletes the share page's thumbnails. Your recordings are left alone.
 - If the `.local` address doesn't open, use the one with the number (IP address).
 
 ## Troubleshooting
