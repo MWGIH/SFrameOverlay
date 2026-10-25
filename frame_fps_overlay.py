@@ -16,6 +16,7 @@ dashboard.
 import configparser
 import ctypes
 import glob
+import json
 import os
 import signal
 import subprocess
@@ -33,6 +34,11 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.ini")
 SOURCE_DIR_FILE = os.path.join(CONFIG_DIR, "source_dir")
 # Counts starts that ended before running STABLE_SECONDS; see main().
 START_GUARD_FILE = os.path.join(CONFIG_DIR, "failed_starts")
+# While SFRecorder records, it writes the view it records here (tangents from
+# straight ahead: left, right, up, down), so the HUD can stay inside the video.
+RECORDER_VIEW_FILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "sfrecorder", "view.json")
+# Gap kept between the HUD and the edge of the recorded view, as a tangent.
+RECORDER_VIEW_INSET = 0.03
 STABLE_SECONDS = 60.0
 MAX_FAILED_STARTS = 2
 
@@ -140,13 +146,47 @@ class Settings:
             pass
         self.load()
 
-    def head_transform(self):
+    def head_transform(self, height_m=None, view=None):
+        """Where the HUD sits relative to the head. With `view` (SFRecorder's recorded
+        view) and the HUD's height, it is moved just far enough to be inside that view."""
+        x = -self.margin_x if "left" in self.corner else self.margin_x
+        y = self.margin_y if "top" in self.corner else -self.margin_y
+        if view and height_m:
+            x, y = fit_in_view(x, y, self.width_m, height_m, self.distance, view)
         m = openvr.HmdMatrix34_t()
         m[0][0] = m[1][1] = m[2][2] = 1.0
-        m[0][3] = -self.margin_x if "left" in self.corner else self.margin_x
-        m[1][3] = self.margin_y if "top" in self.corner else -self.margin_y
+        m[0][3] = x
+        m[1][3] = y
         m[2][3] = -self.distance
         return m
+
+
+def fit_in_view(x, y, width_m, height_m, distance, view):
+    """Moves a panel centred at (x, y) metres (y up) at `distance` so all of it is inside
+    `view` (left, right, up, down tangents), keeping RECORDER_VIEW_INSET from its edges.
+    A panel already inside stays put."""
+    hw, hh = width_m / 2 / distance, height_m / 2 / distance
+    tx, ty = x / distance, y / distance
+
+    def clamp(v, lo, hi):
+        return (lo + hi) / 2 if lo > hi else max(lo, min(hi, v))
+
+    tx = clamp(tx, -view["left"] + hw + RECORDER_VIEW_INSET, view["right"] - hw - RECORDER_VIEW_INSET)
+    ty = clamp(ty, -view["down"] + hh + RECORDER_VIEW_INSET, view["up"] - hh - RECORDER_VIEW_INSET)
+    return tx * distance, ty * distance
+
+
+def read_recorder_view():
+    """SFRecorder's recorded view while it records with the HUD shown, else None."""
+    try:
+        with open(RECORDER_VIEW_FILE) as f:
+            view = json.load(f)
+        os.kill(int(view["pid"]), 0)  # a file left by a recorder that crashed doesn't count
+        if view.get("hud") == "hide":
+            return None
+        return {k: float(view[k]) for k in ("left", "right", "up", "down")}
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
 
 
 def read_enabled():
@@ -395,6 +435,8 @@ class Hud:
         self.values = None
         self.text_key = None        # (rows, values) last sent to a text layer
         self.pending = None         # text image waiting to go to the back layer
+        self.recorder_view = None   # SFRecorder's recorded view, while it records
+        self.settings = None
 
     def configure(self, settings):
         """Applies placement, size and background. The background is only redrawn if its look changed."""
@@ -404,11 +446,25 @@ class Hud:
             self.layout_key = layout_key
             img = self._render_background(settings.background_alpha)
             self.overlay.setOverlayRaw(self.background, to_texture(img), img.width, img.height, 4)
+        self.settings = settings
         for handle in [self.background, *self.text]:
             self.overlay.setOverlayWidthInMeters(handle, settings.width_m)
-            self.overlay.setOverlayTransformTrackedDeviceRelative(
-                handle, openvr.k_unTrackedDeviceIndex_Hmd, settings.head_transform())
+        self._place()
         self._queue_text()
+
+    def follow_recorder(self, view):
+        """Keeps the HUD inside SFRecorder's recorded view (None: back to its own spot)."""
+        if view != self.recorder_view:
+            self.recorder_view = view
+            self._place()
+
+    def _place(self):
+        if self.settings is None:
+            return
+        height_m = self.settings.width_m * self._height() / self.WIDTH
+        transform = self.settings.head_transform(height_m, self.recorder_view)
+        for handle in [self.background, *self.text]:
+            self.overlay.setOverlayTransformTrackedDeviceRelative(handle, openvr.k_unTrackedDeviceIndex_Hmd, transform)
 
     def set_visible(self, visible):
         self.visible = visible
@@ -789,6 +845,7 @@ def run(on_stable):
 
         if frame_start >= next_refresh_poll:
             next_refresh_poll = frame_start + REFRESH_POLL_SECONDS
+            hud.follow_recorder(read_recorder_view())
             refresh_hz = display_refresh_hz(vr_system) or refresh_hz
 
         if enabled and frame_start >= next_update:
