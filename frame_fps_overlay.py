@@ -176,17 +176,31 @@ def fit_in_view(x, y, width_m, height_m, distance, view):
     return tx * distance, ty * distance
 
 
-def read_recorder_view():
-    """SFRecorder's recorded view while it records with the HUD shown, else None."""
+def read_recorder_file():
+    """SFRecorder's view.json while it records, else None."""
     try:
         with open(RECORDER_VIEW_FILE) as f:
             view = json.load(f)
         os.kill(int(view["pid"]), 0)  # a file left by a recorder that crashed doesn't count
-        if view.get("hud") == "hide":
-            return None
-        return {k: float(view[k]) for k in ("left", "right", "up", "down")}
+        return view
     except (OSError, ValueError, KeyError, TypeError):
         return None
+
+
+def read_recorder_view(view):
+    """SFRecorder's recorded view while it records with the HUD shown, else None."""
+    if not view or view.get("hud") == "hide":
+        return None
+    try:
+        return {k: float(view[k]) for k in ("left", "right", "up", "down")}
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def recorder_hides_hud(view):
+    """True while SFRecorder records with "Show in recordings" off. The recorder
+    captures what the panels show, so the HUD is hidden in the headset meanwhile."""
+    return bool(view) and view.get("hud") == "hide"
 
 
 def read_enabled():
@@ -733,6 +747,8 @@ def run(on_stable):
     overlay.setOverlayRaw(thumb_handle, to_texture(thumb), thumb.width, thumb.height, 4)
 
     enabled = None
+    recorder_hidden = False
+    recorder_mtime = None
     state_mtime = None
     next_update = 0.0
     status = ""
@@ -833,7 +849,7 @@ def run(on_stable):
             new_state = read_enabled()
             if new_state != enabled:
                 enabled = new_state
-                hud.set_visible(enabled)
+                hud.set_visible(enabled and not recorder_hidden)
                 redraw_menu()
                 next_update = 0.0
 
@@ -843,9 +859,20 @@ def run(on_stable):
             status = ""
             redraw_menu()
 
-        if frame_start >= next_refresh_poll:
+        # The recorder's file is checked every frame (one stat) so a recording
+        # that starts with the HUD hidden doesn't catch it in its first second.
+        try:
+            mtime = os.stat(RECORDER_VIEW_FILE).st_mtime_ns
+        except OSError:
+            mtime = None
+        if frame_start >= next_refresh_poll or mtime != recorder_mtime:
             next_refresh_poll = frame_start + REFRESH_POLL_SECONDS
-            hud.follow_recorder(read_recorder_view())
+            recorder_mtime = mtime
+            recorder = read_recorder_file()
+            hud.follow_recorder(read_recorder_view(recorder))
+            if recorder_hides_hud(recorder) != recorder_hidden:
+                recorder_hidden = not recorder_hidden
+                hud.set_visible(bool(enabled) and not recorder_hidden)
             refresh_hz = display_refresh_hz(vr_system) or refresh_hz
 
         if enabled and frame_start >= next_update:
