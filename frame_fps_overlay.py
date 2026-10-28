@@ -230,16 +230,31 @@ def run_detached(command):
 
 
 class VRFrameStats:
-    """FPS and frame time of the VR app currently submitting frames to the SteamVR compositor."""
+    """
+    FPS, frame time and GPU % of the VR app currently submitting frames to the SteamVR
+    compositor.
+
+    GPU % comes from the GPU times SteamVR measures for every frame (with GPU
+    timestamps): the game's work before and after it submits, plus the compositor's
+    own work, as a share of the time that passed. The kernel's per-process busy time
+    (GpuStats) is only used when SteamVR reports no GPU times: it counts how long a job
+    took from start to finish, and on the SteamOS beta that reads 100% all the time.
+    """
 
     def __init__(self, compositor):
         self.compositor = compositor
         self.timings = (openvr.Compositor_FrameTiming * TIMING_HISTORY)()
         self.newest_time = None
         self.newest_seen_at = 0.0
+        self.gpu_percent = None
 
     def sample(self, window):
-        """Returns (fps, frame_time_ms) over the last `window` seconds, or None when no app is rendering."""
+        """
+        Returns (fps, frame_time_ms) over the last `window` seconds, or None when no app
+        is rendering. Also sets self.gpu_percent for the same window (None when SteamVR
+        reports no GPU times).
+        """
+        self.gpu_percent = None
         self.timings[0].m_nSize = ctypes.sizeof(openvr.Compositor_FrameTiming)
         count = self.compositor.function_table.getFrameTimings(ctypes.byref(self.timings[0]), TIMING_HISTORY)
         if count < 2:
@@ -260,7 +275,22 @@ class VRFrameStats:
         fps = (len(recent) - 1) / span
         intervals = [f.m_flClientFrameIntervalMs for f in recent if f.m_flClientFrameIntervalMs > 0]
         frame_ms = sum(intervals) / len(intervals) if intervals else 1000.0 / fps
+        self.gpu_percent = self._gpu_percent(recent, span)
         return fps, frame_ms
+
+    @staticmethod
+    def _gpu_percent(recent, span):
+        # A game frame the compositor shows more than once (reprojection) keeps its
+        # frame index, so its GPU time is only counted once.
+        game_ms, compositor_ms, seen = 0.0, 0.0, set()
+        for f in recent[1:]:
+            compositor_ms += f.m_flCompositorRenderGpuMs
+            if f.m_nFrameIndex not in seen:
+                seen.add(f.m_nFrameIndex)
+                game_ms += f.m_flPreSubmitGpuMs + f.m_flPostSubmitGpuMs
+        if game_ms + compositor_ms <= 0:
+            return None
+        return max(0.0, min(100.0, 100.0 * (game_ms + compositor_ms) / (span * 1000)))
 
 
 class CpuStats:
@@ -879,9 +909,12 @@ def run(on_stable):
             window = settings.update_ms / 1000
             next_update = frame_start + window
             frame = vr_frames.sample(window)
+            gpu = vr_frames.gpu_percent
+            if gpu is None:
+                gpu = gpu_stats.percent()
             width, height = vr_system.getRecommendedRenderTargetSize()
             resolution = (width, height) if width and height else None
-            hud.show_values(format_values(frame, refresh_hz, cpu_stats.percent(), gpu_stats.percent(),
+            hud.show_values(format_values(frame, refresh_hz, cpu_stats.percent(), gpu,
                                           battery_stats.read(), resolution))
 
         time.sleep(seconds_until_next_frame(vr_system, refresh_hz, frame_start))
